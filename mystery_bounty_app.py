@@ -435,6 +435,17 @@ st.markdown("""
         font-size: 0.75rem; font-weight: 600; margin-left: 6px; }
     .compare-a { background: #1f6feb33; color: #58a6ff; }
     .compare-b { background: #f0883e33; color: #f0883e; }
+    /* Red Run Simulation button */
+    button[kind="primary"], .stButton > button[kind="primary"],
+    div.stButton > button[type="button"][kind="primary"] {
+        background-color: #e63946 !important;
+        border-color: #e63946 !important;
+        color: white !important;
+    }
+    button[kind="primary"]:hover, .stButton > button[kind="primary"]:hover {
+        background-color: #c1121f !important;
+        border-color: #c1121f !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
