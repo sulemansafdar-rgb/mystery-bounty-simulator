@@ -1177,70 +1177,86 @@ with tab_compare:
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 4: Code Editor — Edit & Deploy this app directly
 # ═══════════════════════════════════════════════════════════════════════════════
-# This tab lets anyone with a GitHub token edit the source code and push changes.
-# Streamlit Cloud auto-deploys from GitHub, so changes go live within ~1 minute.
-#
-# SETUP: The editor needs a GitHub Personal Access Token (PAT) with Contents
-#        read/write permission for the mystery-bounty-simulator repo.
-#        Generate at: https://github.com/settings/tokens?type=beta
-#
-# HOW IT WORKS:
-#   1. Load: Fetches the latest mystery_bounty_app.py from GitHub API
-#   2. Edit: User modifies code in a Streamlit text_area
-#   3. Push: Sends the updated file back via GitHub Contents API (PUT)
-#   4. Deploy: Streamlit Cloud detects the commit and auto-redeploys
+# Shows only the simulator-logic sections (engine, SQL, CSS) — not UI boilerplate.
+# Edits are merged back into the full file and pushed to GitHub.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# --- GitHub API helpers for the Code Editor tab ---
 GITHUB_REPO = "sulemansafdar-rgb/mystery-bounty-simulator"
 GITHUB_FILE = "mystery_bounty_app.py"
 GITHUB_BRANCH = "main"
 
+# --- Section definitions: (label, start_pattern, end_pattern) ---
+# Each section is extracted from start_pattern up to (but not including) end_pattern.
+EDITABLE_SECTIONS = [
+    ("🎯 Tier Recommendation (recommend_k)",
+     "    def recommend_k(self):", "    def _generate_weights(self, k):"),
+    ("📊 Distribution Weights (_generate_weights)",
+     "    def _generate_weights(self, k):", "    def _allocate_players(self, k):"),
+    ("👥 Player Allocation (_allocate_players)",
+     "    def _allocate_players(self, k):", "    def _reconcile_pool(self, vals, counts):"),
+    ("💰 Pool Reconciliation (_reconcile_pool)",
+     "    def _reconcile_pool(self, vals, counts):", "    def build(self, k=None):"),
+    ("🏗️ Build Pipeline (build)",
+     "    def build(self, k=None):", "\n\n# ─────"),
+    ("🔌 SQL: Bounty Tournament Query",
+     "BOUNTY_TOURNAMENT_QUERY = \"\"\"", "ALL_TOURNAMENT_QUERY = \"\"\""),
+    ("🔌 SQL: All Tournament Query",
+     "ALL_TOURNAMENT_QUERY = \"\"\"", "\n\n# ─────"),
+    ("🎨 CSS & Styling",
+     "# Custom CSS\nst.markdown(\"\"\"", "\"\"\", unsafe_allow_html=True)"),
+]
+
+
+def extract_section(full_code: str, start: str, end: str) -> tuple:
+    """Extract a section of code between start and end patterns.
+    Returns (section_text, start_idx, end_idx) or (None, -1, -1) if not found.
+    """
+    s = full_code.find(start)
+    if s == -1:
+        return None, -1, -1
+    e = full_code.find(end, s + len(start))
+    if e == -1:
+        e = len(full_code)
+    return full_code[s:e], s, e
+
+
+def replace_section(full_code: str, start_idx: int, end_idx: int, new_text: str) -> str:
+    """Replace a section in the full code."""
+    return full_code[:start_idx] + new_text + full_code[end_idx:]
+
 
 def github_load_file(token: str) -> tuple:
-    """Load a file from GitHub. Returns (content_string, sha) or (None, None) on error."""
-    import requests
-    import base64
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
+    """Load a file from GitHub. Returns (content, sha) or (None, error_msg)."""
+    import requests as _req
+    import base64 as _b64
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}?ref={GITHUB_BRANCH}"
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
+        resp = _req.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        content = base64.b64decode(data["content"]).decode("utf-8")
-        return content, data["sha"]
+        return _b64.b64decode(data["content"]).decode("utf-8"), data["sha"]
     except Exception as e:
         return None, str(e)
 
 
 def github_push_file(token: str, content: str, sha: str, message: str = "") -> tuple:
-    """Push updated file to GitHub. Returns (success: bool, message: str)."""
-    import requests
-    import base64
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/vnd.github.v3+json",
-    }
+    """Push updated file to GitHub. Returns (success, new_sha_or_error)."""
+    import requests as _req
+    import base64 as _b64
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+               "Accept": "application/vnd.github.v3+json"}
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
-    commit_msg = message or "Update mystery_bounty_app.py via Code Editor"
     payload = {
-        "message": commit_msg,
-        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-        "sha": sha,
-        "branch": GITHUB_BRANCH,
+        "message": message or "Update simulator logic via Code Editor",
+        "content": _b64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "sha": sha, "branch": GITHUB_BRANCH,
     }
     try:
-        resp = requests.put(url, json=payload, headers=headers, timeout=30)
+        resp = _req.put(url, json=payload, headers=headers, timeout=30)
         if resp.status_code in (200, 201):
-            new_sha = resp.json()["content"]["sha"]
-            return True, new_sha
-        else:
-            err = resp.json().get("message", resp.text[:200])
-            return False, f"GitHub error {resp.status_code}: {err}"
+            return True, resp.json()["content"]["sha"]
+        return False, f"GitHub error {resp.status_code}: {resp.json().get('message', '')}"
     except Exception as e:
         return False, str(e)
 
@@ -1248,12 +1264,12 @@ def github_push_file(token: str, content: str, sha: str, message: str = "") -> t
 with tab_editor:
     st.subheader("✏️ Code Editor — Edit & Deploy")
     st.caption(
-        "Edit this app's source code directly and push to GitHub. "
-        "Streamlit Cloud auto-deploys within ~1 minute after push."
+        "Edit the mystery bounty simulator logic below. "
+        "Only the core logic sections are shown — UI boilerplate is hidden. "
+        "Changes are merged into the full file and pushed to GitHub."
     )
 
-    # --- GitHub Token Input ---
-    # Try loading from Streamlit secrets first
+    # --- GitHub Token (auto-load from secrets) ---
     gh_secrets_token = ""
     try:
         gh_secrets_token = st.secrets.get("GITHUB_PAT", "")
@@ -1266,28 +1282,19 @@ with tab_editor:
         "GitHub Personal Access Token",
         type="password",
         value=st.session_state.get("github_pat", ""),
-        help=(
-            "Generate at github.com/settings/tokens → Fine-grained → "
-            "Select repo 'mystery-bounty-simulator' → Contents: Read & Write → Generate. "
-            "Or set GITHUB_PAT in Streamlit Cloud Secrets."
-        ),
+        help="Auto-loaded from Streamlit Secrets (GITHUB_PAT). Or paste manually.",
     )
     if gh_token:
         st.session_state["github_pat"] = gh_token
 
     if not gh_token:
         st.info(
-            "🔑 **Setup required:** Enter a GitHub Personal Access Token above to enable the editor.\n\n"
-            "**How to get one (1 minute):**\n"
-            "1. Go to [github.com/settings/tokens](https://github.com/settings/tokens?type=beta)\n"
-            "2. Click 'Generate new token' (Fine-grained)\n"
-            "3. Name: `mystery-bounty-editor`\n"
-            "4. Repository access → Select 'mystery-bounty-simulator'\n"
-            "5. Permissions → Contents: Read and Write\n"
-            "6. Click Generate → copy and paste the token above"
+            "🔑 **Setup required:** Enter a GitHub Personal Access Token above.\n\n"
+            "**Quick setup:** Go to [github.com/settings/tokens](https://github.com/settings/tokens?type=beta) "
+            "→ Generate new token → Select 'mystery-bounty-simulator' repo → Contents: Read & Write → Generate."
         )
     else:
-        # --- Load / Edit / Push workflow ---
+        # --- Load / Push buttons ---
         ecol1, ecol2, ecol3 = st.columns([1, 1, 2])
         with ecol1:
             load_btn = st.button("📥 Load from GitHub", use_container_width=True)
@@ -1295,95 +1302,132 @@ with tab_editor:
             push_btn = st.button("🚀 Push & Deploy", type="primary", use_container_width=True)
         with ecol3:
             commit_msg = st.text_input(
-                "Commit message",
-                value="Update via Code Editor",
-                label_visibility="collapsed",
-                placeholder="Commit message (optional)",
+                "Commit message", value="Update simulator logic via Code Editor",
+                label_visibility="collapsed", placeholder="Commit message",
             )
 
-        # Load file
+        # --- Load ---
         if load_btn:
             with st.spinner("Loading from GitHub..."):
                 content, sha_or_err = github_load_file(gh_token)
             if content is not None:
-                st.session_state["editor_code"] = content
+                st.session_state["editor_full_code"] = content
                 st.session_state["editor_sha"] = sha_or_err
                 st.session_state["editor_loaded"] = True
-                st.success(f"Loaded {len(content):,} chars, {content.count(chr(10))+1} lines")
+                # Extract all sections
+                for i, (label, start_pat, end_pat) in enumerate(EDITABLE_SECTIONS):
+                    section_text, _, _ = extract_section(content, start_pat, end_pat)
+                    if section_text is not None:
+                        st.session_state[f"section_{i}_original"] = section_text
+                st.success(f"✅ Loaded! Showing {len(EDITABLE_SECTIONS)} editable logic sections.")
             else:
                 st.error(f"Load failed: {sha_or_err}")
 
-        # Show editor if code is loaded
+        # --- Show section editors ---
         if st.session_state.get("editor_loaded"):
-            # Section jump links
-            st.caption("**Jump to section:**")
-            sections = {
-                "Engine": "SECTION 1: ENGINE",
-                "Weights": "_generate_weights",
-                "Allocate": "_allocate_players",
-                "Reconcile": "_reconcile_pool",
-                "Build": "def build(self",
-                "Metabase": "METABASE CLIENT",
-                "SQL": "BOUNTY_TOURNAMENT_QUERY",
-                "CSS": "Custom CSS",
-                "Sidebar": "SIDEBAR: Engine",
-                "Simulate": "def run_simulation",
-                "Render": "def render_results",
-                "Tab1": "TAB 1: Manual",
-                "Tab2": "TAB 2: Load",
-                "Tab3": "TAB 3: Compare",
-                "Tab4": "TAB 4: Code Editor",
-            }
+            st.divider()
+            st.caption("**Select a section to edit** — only simulator logic is shown, UI code is hidden.")
 
-            # Search functionality
-            search_term = st.text_input("🔍 Search in code", placeholder="Type to search...")
-            if search_term:
-                code = st.session_state.get("editor_code", "")
-                occurrences = code.count(search_term)
-                if occurrences > 0:
-                    # Find line number of first occurrence
-                    idx = code.index(search_term)
-                    line_num = code[:idx].count("\n") + 1
-                    st.info(f"Found **{occurrences}** occurrence(s). First at **line {line_num}**.")
-                else:
-                    st.warning(f"'{search_term}' not found.")
+            # Section selector
+            section_labels = [s[0] for s in EDITABLE_SECTIONS]
+            selected_section = st.selectbox("Section", section_labels, key="section_picker")
+            section_idx = section_labels.index(selected_section)
 
-            # The editor
-            edited_code = st.text_area(
-                "Source Code",
-                value=st.session_state.get("editor_code", ""),
-                height=600,
-                key="code_editor_area",
-                help="Edit the Python source code. Use Push & Deploy to save changes.",
-            )
+            label, start_pat, end_pat = EDITABLE_SECTIONS[section_idx]
+            original_section = st.session_state.get(f"section_{section_idx}_original", "")
 
-            # Track changes
-            original = st.session_state.get("editor_code", "")
-            if edited_code != original:
-                diff_lines = abs(edited_code.count("\n") - original.count("\n"))
-                diff_chars = abs(len(edited_code) - len(original))
-                st.caption(f"📝 **Unsaved changes:** ~{diff_chars} chars, ~{diff_lines} lines changed")
+            if original_section:
+                line_count = original_section.count("\n") + 1
+                st.caption(f"**{label}** — {line_count} lines")
 
-            # Push changes
+                # Editable text area for this section
+                edited_section = st.text_area(
+                    f"Edit: {label}",
+                    value=original_section,
+                    height=max(200, min(600, line_count * 18)),
+                    key=f"editor_section_{section_idx}",
+                    label_visibility="collapsed",
+                )
+
+                # Show change indicator
+                if edited_section != original_section:
+                    char_diff = len(edited_section) - len(original_section)
+                    st.caption(f"📝 **Unsaved changes:** {'+' if char_diff >= 0 else ''}{char_diff} chars")
+            else:
+                st.warning(f"Section '{label}' not found in the code. Pattern may have changed.")
+                edited_section = original_section
+
+            # --- Push ---
             if push_btn:
-                if edited_code == original:
-                    st.warning("No changes to push.")
+                full_code = st.session_state.get("editor_full_code", "")
+                sha = st.session_state.get("editor_sha")
+                if not sha or not full_code:
+                    st.error("Load the code from GitHub first.")
                 else:
+                    # Merge the edited section back into full code
+                    _, s_idx, e_idx = extract_section(full_code, start_pat, end_pat)
+                    if s_idx == -1:
+                        st.error("Could not locate section in full code. Try reloading.")
+                    elif edited_section == original_section:
+                        st.warning("No changes to push.")
+                    else:
+                        merged = replace_section(full_code, s_idx, e_idx, edited_section)
+
+                        # Validate Python syntax before pushing
+                        import ast as _ast
+                        try:
+                            _ast.parse(merged)
+                        except SyntaxError as syn_err:
+                            st.error(f"⚠️ **Syntax error — not pushed.** Fix before deploying:\n\n`{syn_err}`")
+                            merged = None
+
+                        if merged:
+                            with st.spinner("Pushing to GitHub..."):
+                                success, result = github_push_file(gh_token, merged, sha, commit_msg)
+                            if success:
+                                st.session_state["editor_full_code"] = merged
+                                st.session_state["editor_sha"] = result
+                                st.session_state[f"section_{section_idx}_original"] = edited_section
+                                st.success(
+                                    "✅ **Pushed!** Streamlit Cloud will auto-deploy in ~1 minute. "
+                                    "Refresh the app to see your changes."
+                                )
+                                st.balloons()
+                            else:
+                                st.error(f"Push failed: {result}")
+
+            # --- Full code toggle (advanced) ---
+            with st.expander("🔧 Advanced: View/Edit Full Code"):
+                st.caption("⚠️ This shows the entire file including Streamlit UI code. Edit with care.")
+                full_code_display = st.text_area(
+                    "Full source code",
+                    value=st.session_state.get("editor_full_code", ""),
+                    height=400,
+                    key="full_code_area",
+                    label_visibility="collapsed",
+                )
+                if st.button("🚀 Push Full Code", key="push_full"):
                     sha = st.session_state.get("editor_sha")
                     if not sha:
-                        st.error("Missing file SHA. Load the file from GitHub first.")
+                        st.error("Load first.")
                     else:
-                        with st.spinner("Pushing to GitHub..."):
-                            success, result = github_push_file(gh_token, edited_code, sha, commit_msg)
-                        if success:
-                            st.session_state["editor_code"] = edited_code
-                            st.session_state["editor_sha"] = result
-                            st.success(
-                                "✅ **Pushed successfully!** Streamlit Cloud will auto-deploy in ~1 minute. "
-                                "Refresh the app after a minute to see your changes."
-                            )
-                            st.balloons()
-                        else:
-                            st.error(f"Push failed: {result}")
+                        import ast as _ast
+                        try:
+                            _ast.parse(full_code_display)
+                        except SyntaxError as syn_err:
+                            st.error(f"Syntax error: {syn_err}")
+                            full_code_display = None
+                        if full_code_display:
+                            with st.spinner("Pushing full code..."):
+                                success, result = github_push_file(
+                                    gh_token, full_code_display, sha, commit_msg
+                                )
+                            if success:
+                                st.session_state["editor_full_code"] = full_code_display
+                                st.session_state["editor_sha"] = result
+                                st.success("✅ Full code pushed!")
+                                st.balloons()
+                            else:
+                                st.error(f"Push failed: {result}")
         else:
             st.info("Click **📥 Load from GitHub** to start editing.")
