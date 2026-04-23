@@ -9,6 +9,55 @@ Usage:
 
 Metabase integration: loads real tournament data from cp_prod (DB 133, Athena)
 to simulate mystery bounty distributions on actual CoinPoker tournaments.
+
+TABLE OF CONTENTS (search for these section headers to jump around):
+=====================================================================
+  SECTION 1: ENGINE — BountyArchitect v6.2      (line ~35)
+      - __init__        : Input validation & parameter storage
+      - recommend_k     : Auto-calculate optimal number of tiers
+      - _generate_weights: Player distribution weights (3 modes)
+      - _allocate_players: Assign players to tiers with scarcity cap
+      - _reconcile_pool : Integer-cent pool balancing algorithm
+      - _build_values   : Generate bounty values with multiplier decay
+      - build           : Main entry point — orchestrates the full pipeline
+
+  SECTION 2: METABASE INTEGRATION               (line ~360)
+      - query_metabase  : Execute SQL against cp_prod via Metabase API
+      - BOUNTY_TOURNAMENT_QUERY : SQL for PKO/bounty tournaments
+      - ALL_TOURNAMENT_QUERY    : SQL for all tournaments
+
+  SECTION 3: STREAMLIT APP CONFIG & CSS          (line ~420)
+      - Page config, theme, custom CSS styles
+      - TO CHANGE BUTTON COLOR: search for "Red Run Simulation button"
+      - TO CHANGE THEME COLORS: edit the .streamlit/config.toml file
+
+  SECTION 4: SIDEBAR — Engine Parameters         (line ~455)
+      - Distribution mode selector (power_decay, linear_decay, gaussian_mid)
+      - Curve strength, multiplier range, tier settings
+      - Metabase API key connection (auto-loads from Streamlit secrets)
+
+  SECTION 5: SIMULATION & RENDERING FUNCTIONS    (line ~530)
+      - run_simulation  : Wraps BountyArchitect and returns results dict
+      - render_results  : Displays charts, metrics, and distribution table
+
+  SECTION 6: TAB 1 — Manual Simulator            (line ~725)
+      - User inputs: pool, players, min/max bounty
+      - Run button, export (CSV/JSON), save to comparison
+
+  SECTION 7: TAB 2 — Load from CoinPoker         (line ~770)
+      - Fetches real tournament data from Metabase
+      - Tournament picker, pool source modes, simulation
+
+  SECTION 8: TAB 3 — Compare Runs                (line ~930)
+      - Side-by-side comparison of saved simulation runs
+      - Overlay charts and parameter diff table
+
+CONFIGURATION:
+==============
+  - Metabase API Key : Set in Streamlit Cloud Secrets (METABASE_API_KEY)
+  - Database         : cp_prod (DB ID 133, Athena engine)
+  - Data source table: lakehouse_gold.user_tournament_play_history
+  - lobby_id = 9     : Excluded (freerolls, not real-money tournaments)
 """
 
 import math
@@ -21,12 +70,47 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENGINE — BountyArchitect v6.2 (embedded for single-file deployment)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: ENGINE — BountyArchitect v6.2
+# ═══════════════════════════════════════════════════════════════════════════════
+# This is the core math engine. It takes tournament parameters and generates
+# a mystery bounty prize distribution table.
+#
+# HOW IT WORKS (high level):
+#   1. recommend_k()      → Decide how many tiers (K) based on pool size/range
+#   2. _build_values()    → Generate bounty values using multiplier decay
+#   3. _allocate_players() → Distribute players across tiers (pyramid shape)
+#   4. _reconcile_pool()  → Fine-tune values so total = exact pool amount
+#
+# TO MODIFY THE DISTRIBUTION SHAPE:
+#   - Change _generate_weights() to alter how players are spread across tiers
+#   - Change _build_values() to alter how bounty amounts grow tier-to-tier
+#   - Change max_top_tier_count to limit how many players get top prizes
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class BountyArchitect:
-    """Mystery Bounty prize distribution engine v6.2."""
+    """Mystery Bounty prize distribution engine v6.2.
+
+    Generates a complete prize distribution table for mystery bounty tournaments.
+    Uses integer-cent arithmetic internally for exact pool matching (no rounding errors).
+
+    Parameters:
+        pool (float)        : Total bounty pool in USDT
+        players (int)       : Number of players receiving bounties
+        min_bounty (float)  : Smallest possible bounty prize
+        max_bounty (float)  : Largest possible bounty prize (jackpot)
+        mult_start (float)  : Tier-to-tier ratio at the low end (default 2.0)
+        mult_end (float)    : Tier-to-tier ratio at the high end (default 1.5)
+        mode (str)          : Distribution curve — "power_decay", "linear_decay", or "gaussian_mid"
+        strength (float)    : How aggressive the curve is (higher = steeper)
+        max_top_tier_count  : Max players allowed in the top 3 tiers combined
+        denomination (int)  : Values snap to this grid (e.g. 5 → $5, $10, $15...)
+
+    Example:
+        engine = BountyArchitect(pool=10000, players=100, min_bounty=10, max_bounty=1000)
+        k, vals, counts = engine.build()
+        # k=7, vals=[10, 20, 40, 80, 160, 320, 640], counts=[35, 25, 18, 12, 6, 3, 1]
+    """
 
     def __init__(self, pool, players, min_bounty, max_bounty,
                  mult_start=2.0, mult_end=1.5,
@@ -60,6 +144,14 @@ class BountyArchitect:
         self.warnings = []
 
     def recommend_k(self):
+        """Auto-calculate the optimal number of tiers (K).
+
+        Uses the geometric mean of multipliers and the min/max bounty range
+        to determine how many tiers fit naturally. Clamped to 4-12 range.
+
+        Returns:
+            int: Recommended number of tiers (K)
+        """
         avg_r = math.sqrt(self.mult_start * self.mult_end)
         k = max(4, min(12, round(
             math.log(self.max_val / self.min_val) / math.log(avg_r)
@@ -70,6 +162,23 @@ class BountyArchitect:
         return k
 
     def _generate_weights(self, k):
+        """Generate player distribution weights for K tiers.
+
+        Three distribution modes available:
+          - power_decay  : Exponential decay — most players in low tiers (pyramid)
+          - linear_decay : Simple staircase — evenly spaced reduction
+          - gaussian_mid : Bell curve — peak in middle tiers
+
+        TO ADD A NEW DISTRIBUTION MODE:
+          1. Add an elif block below with your mode name
+          2. Generate a list of K raw weights (higher = more players)
+          3. The weights are auto-normalized to sum to 1.0
+
+        Args:
+            k (int): Number of tiers
+        Returns:
+            list[float]: Normalized weights summing to 1.0
+        """
         if self.mode == "power_decay":
             decay = max(0.40, min(0.80, 0.85 - (self.strength * 0.10)))
             raw = [decay ** (k - 1 - i) for i in range(k)]
@@ -87,6 +196,19 @@ class BountyArchitect:
         return [w / s for w in raw]
 
     def _allocate_players(self, k):
+        """Distribute players across K tiers using weighted allocation.
+
+        Steps:
+          1. Start with 1 player per tier (minimum guarantee)
+          2. Distribute remaining players proportional to weights
+          3. Apply top-tier scarcity cap (top 3 tiers combined ≤ max_top)
+          4. Enforce strict monotonic pyramid (each tier ≥ tier above it)
+
+        Args:
+            k (int): Number of tiers
+        Returns:
+            list[int]: Player count per tier (index 0 = lowest, k-1 = highest)
+        """
         weights = self._generate_weights(k)
         counts = [1] * k
         remaining = self.players - k
@@ -146,6 +268,21 @@ class BountyArchitect:
         return counts
 
     def _reconcile_pool(self, vals, counts):
+        """Fine-tune bounty values so the total exactly matches the pool.
+
+        Uses integer-cent arithmetic (all values × 100) to avoid floating-point
+        errors. Adjusts middle tiers up/down by denomination steps until the
+        total matches exactly. Falls back to single-cent adjustments, then
+        two-tier adjustments, then player reallocation if needed.
+
+        This is the most complex method — it ensures $0.00 pool error every time.
+
+        Args:
+            vals (list[float])  : Bounty values per tier
+            counts (list[int])  : Player counts per tier
+        Returns:
+            tuple: (adjusted_vals, adjusted_counts, pool_error_in_cents)
+        """
         k = len(vals)
         c_vals = [int(round(v * 100)) for v in vals]
         target_cents = int(round(self.pool * 100))
@@ -291,6 +428,21 @@ class BountyArchitect:
         return final_vals
 
     def build(self, k=None):
+        """Main entry point — build the complete bounty distribution.
+
+        Orchestrates the full pipeline: K recommendation → value generation →
+        player allocation → pool reconciliation.
+
+        Args:
+            k (int, optional): Override number of tiers. If None, auto-recommends.
+        Returns:
+            tuple: (k, vals, counts)
+              - k (int)          : Number of tiers used
+              - vals (list[float]): Bounty value per tier (ascending)
+              - counts (list[int]): Player count per tier (descending)
+        Raises:
+            ValueError: If pool cannot be distributed within constraints
+        """
         if k is None:
             k = self.recommend_k()
         multipliers = [
@@ -339,6 +491,21 @@ def get_metabase_session():
 
 
 def query_metabase(sql: str) -> pd.DataFrame:
+    """Execute a SQL query against CoinPoker's cp_prod database via Metabase API.
+
+    TO CHANGE THE DATABASE:
+      - Change DB_ID below (133 = cp_prod on Athena)
+      - Change METABASE_URL if using a different Metabase instance
+
+    TO ADD NEW QUERIES:
+      - Add a new SQL template string (like BOUNTY_TOURNAMENT_QUERY)
+      - Call this function with the formatted SQL
+
+    Args:
+        sql (str): Raw SQL query string (Athena/Presto dialect)
+    Returns:
+        pd.DataFrame: Query results as a DataFrame (empty if error/no results)
+    """
     """Execute SQL against cp_prod via Metabase API."""
     import requests
     headers = get_metabase_session()
@@ -370,6 +537,10 @@ def query_metabase(sql: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# --- SQL: Fetch bounty tournaments only (PKO, CoinHunter, etc.) ---
+# Filter: bounty_amount > 0 ensures only tournaments with knockout bounties
+# lobby_id != 9 excludes freerolls
+# TO MODIFY: change the WHERE clause, add columns, or adjust the LIMIT
 BOUNTY_TOURNAMENT_QUERY = """
 SELECT
     tournament_id,
