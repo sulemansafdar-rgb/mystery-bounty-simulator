@@ -12,43 +12,42 @@ to simulate mystery bounty distributions on actual CoinPoker tournaments.
 
 TABLE OF CONTENTS (search for these section headers to jump around):
 =====================================================================
-  SECTION 1: ENGINE — BountyArchitect v6.2      (line ~35)
-      - __init__        : Input validation & parameter storage
-      - recommend_k     : Auto-calculate optimal number of tiers
-      - _generate_weights: Player distribution weights (3 modes)
-      - _allocate_players: Assign players to tiers with scarcity cap
-      - _reconcile_pool : Integer-cent pool balancing algorithm
-      - _build_values   : Generate bounty values with multiplier decay
-      - build           : Main entry point — orchestrates the full pipeline
+  SECTION 1: ENGINE — BountyArchitect v15      (line ~35)
+      - __init__              : Input validation & parameter storage
+      - recommend_k           : Auto-calculate optimal number of tiers
+      - _generate_weights     : Player distribution weights (strength-influenced)
+      - _allocate_players     : Assign players to tiers with pyramid enforcement
+      - _generate_ideal_values: Generate bounty values with dynamic strength curve
+      - build                 : Main entry point — orchestrates the full pipeline
 
-  SECTION 2: METABASE INTEGRATION               (line ~360)
+  SECTION 2: METABASE INTEGRATION               (line ~300)
       - query_metabase  : Execute SQL against cp_prod via Metabase API
       - BOUNTY_TOURNAMENT_QUERY : SQL for PKO/bounty tournaments
       - ALL_TOURNAMENT_QUERY    : SQL for all tournaments
 
-  SECTION 3: STREAMLIT APP CONFIG & CSS          (line ~420)
+  SECTION 3: STREAMLIT APP CONFIG & CSS          (line ~380)
       - Page config, theme, custom CSS styles
       - TO CHANGE BUTTON COLOR: search for "Red Run Simulation button"
       - TO CHANGE THEME COLORS: edit the .streamlit/config.toml file
 
-  SECTION 4: SIDEBAR — Engine Parameters         (line ~455)
+  SECTION 4: SIDEBAR — Engine Parameters         (line ~415)
       - Distribution mode selector (power_decay, linear_decay, gaussian_mid)
       - Curve strength, multiplier range, tier settings
       - Metabase API key connection (auto-loads from Streamlit secrets)
 
-  SECTION 5: SIMULATION & RENDERING FUNCTIONS    (line ~530)
+  SECTION 5: SIMULATION & RENDERING FUNCTIONS    (line ~490)
       - run_simulation  : Wraps BountyArchitect and returns results dict
       - render_results  : Displays charts, metrics, and distribution table
 
-  SECTION 6: TAB 1 — Manual Simulator            (line ~725)
+  SECTION 6: TAB 1 — Manual Simulator            (line ~685)
       - User inputs: pool, players, min/max bounty
       - Run button, export (CSV/JSON), save to comparison
 
-  SECTION 7: TAB 2 — Load from CoinPoker         (line ~770)
+  SECTION 7: TAB 2 — Load from CoinPoker         (line ~730)
       - Fetches real tournament data from Metabase
       - Tournament picker, pool source modes, simulation
 
-  SECTION 8: TAB 3 — Compare Runs                (line ~930)
+  SECTION 8: TAB 3 — Compare Runs                (line ~890)
       - Side-by-side comparison of saved simulation runs
       - Overlay charts and parameter diff table
 
@@ -58,6 +57,11 @@ CONFIGURATION:
   - Database         : cp_prod (DB ID 133, Athena engine)
   - Data source table: lakehouse_gold.user_tournament_play_history
   - lobby_id = 9     : Excluded (freerolls, not real-money tournaments)
+
+ENGINE v15 NOTES — Dynamic Strength Control:
+  - strength > 1.0 = 'Late' Spike/Drop (flat near start, sharp move at top)
+  - strength < 1.0 = 'Early' Spike/Drop (sharp move at start, flat near end)
+  - strength = 1.0 = Linear interpolation
 """
 
 import math
@@ -71,66 +75,66 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: ENGINE — BountyArchitect v6.2
+# SECTION 1: ENGINE — BountyArchitect v15
 # ═══════════════════════════════════════════════════════════════════════════════
-# This is the core math engine. It takes tournament parameters and generates
-# a mystery bounty prize distribution table.
+# Final Unified Engine v15: Dynamic Strength Control for Multiplier Curves.
 #
 # HOW IT WORKS (high level):
-#   1. recommend_k()      → Decide how many tiers (K) based on pool size/range
-#   2. _build_values()    → Generate bounty values using multiplier decay
-#   3. _allocate_players() → Distribute players across tiers (pyramid shape)
-#   4. _reconcile_pool()  → Fine-tune values so total = exact pool amount
+#   1. recommend_k()            → Decide how many tiers (K) based on multiplier fit
+#   2. _generate_ideal_values() → Generate bounty values with dynamic strength curve
+#   3. _allocate_players()      → Distribute players across tiers (pyramid shape)
+#   4. build()                  → Drift-correct values so total ≈ pool amount
+#
+# STRENGTH PARAMETER:
+#   strength > 1.0 = 'Late' Spike/Drop (stays flat near start, sharp move at top)
+#   strength < 1.0 = 'Early' Spike/Drop (sharp move at start, stays flat near end)
+#   strength = 1.0 = Linear
 #
 # TO MODIFY THE DISTRIBUTION SHAPE:
 #   - Change _generate_weights() to alter how players are spread across tiers
-#   - Change _build_values() to alter how bounty amounts grow tier-to-tier
+#   - Change _generate_ideal_values() to alter how bounty amounts grow tier-to-tier
 #   - Change max_top_tier_count to limit how many players get top prizes
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BountyArchitect:
-    """Mystery Bounty prize distribution engine v6.2.
+    """Mystery Bounty prize distribution engine v15.
 
+    Final Unified Engine with Dynamic Strength Control for Multiplier Curves.
     Generates a complete prize distribution table for mystery bounty tournaments.
-    Uses integer-cent arithmetic internally for exact pool matching (no rounding errors).
 
     Parameters:
-        pool (float)        : Total bounty pool in USDT
-        players (int)       : Number of players receiving bounties
-        min_bounty (float)  : Smallest possible bounty prize
-        max_bounty (float)  : Largest possible bounty prize (jackpot)
-        mult_start (float)  : Tier-to-tier ratio at the low end (default 2.0)
-        mult_end (float)    : Tier-to-tier ratio at the high end (default 1.5)
-        mode (str)          : Distribution curve — "power_decay", "linear_decay", or "gaussian_mid"
-        strength (float)    : How aggressive the curve is (higher = steeper)
-        max_top_tier_count  : Max players allowed in the top 3 tiers combined
-        denomination (int)  : Values snap to this grid (e.g. 5 → $5, $10, $15...)
+        pool (float)            : Total bounty pool in USDT
+        players (int)           : Number of players receiving bounties
+        min_bounty (float)      : Smallest possible bounty prize
+        max_bounty (float)      : Largest possible bounty prize (jackpot)
+        mult_start (float)      : Tier-to-tier ratio at the low end (default 2.0)
+        mult_end (float)        : Tier-to-tier ratio at the high end (default 3.0)
+        mode (str)              : Distribution curve — "power_decay", "linear_decay", or "gaussian_mid"
+        strength (float)        : Controls curve shape:
+                                    > 1.0 = Late spike (flat start, sharp top)
+                                    < 1.0 = Early spike (sharp start, flat top)
+                                    = 1.0 = Linear
+        max_top_tier_count (int): Max players allowed in top 3 tiers combined
+        denomination (int)      : Values snap to this grid (e.g. 5 → $5, $10, $15...)
 
     Example:
         engine = BountyArchitect(pool=10000, players=100, min_bounty=10, max_bounty=1000)
-        k, vals, counts = engine.build()
-        # k=7, vals=[10, 20, 40, 80, 160, 320, 640], counts=[35, 25, 18, 12, 6, 3, 1]
+        k, ideal, final, counts = engine.build()
     """
 
     def __init__(self, pool, players, min_bounty, max_bounty,
-                 mult_start=2.0, mult_end=1.5,
-                 mode="power_decay", strength=1.5,
-                 max_top_tier_count=8, denomination=10):
+                 mult_start=2.0, mult_end=3.0, mode="power_decay",
+                 strength=1.5, max_top_tier_count=8, denomination=10):
         if pool <= 0 or players <= 0:
             raise ValueError("Pool and players must be > 0")
+        if players * min_bounty > pool:
+            raise ValueError("Pool cannot cover min_bounty × players")
         if max_bounty <= min_bounty:
             raise ValueError("max_bounty must be > min_bounty")
-        if mult_start <= 1.0 or mult_end <= 1.0:
-            raise ValueError("Multipliers must be > 1.0")
-        if mult_end > mult_start:
-            raise ValueError("mult_end must be <= mult_start")
         if max_top_tier_count < 3:
             raise ValueError("max_top_tier_count must be >= 3")
-        if min_bounty * players > pool:
-            raise ValueError(
-                f"Pool impossible: min({min_bounty}) × players({players}) "
-                f"= {min_bounty * players} > pool({pool})"
-            )
+        if strength <= 0:
+            raise ValueError("Strength must be > 0")
         self.pool = pool
         self.players = players
         self.min_val = min_bounty
@@ -146,63 +150,48 @@ class BountyArchitect:
     def recommend_k(self):
         """Auto-calculate the optimal number of tiers (K).
 
-        Uses the geometric mean of multipliers and the min/max bounty range
-        to determine how many tiers fit naturally. Clamped to 4-12 range.
+        Finds K where the geometric mean of the span fits strictly between
+        mult_start and mult_end, allowing for smooth interpolation.
+        Falls back to log-based estimate if no clean fit is found.
+        Clamped to 5-12 range.
 
         Returns:
             int: Recommended number of tiers (K)
         """
-        avg_r = math.sqrt(self.mult_start * self.mult_end)
-        k = max(4, min(12, round(
-            math.log(self.max_val / self.min_val) / math.log(avg_r)
+        target_ratio = self.max_val / self.min_val
+        r_min = min(self.mult_start, self.mult_end)
+        r_max = max(self.mult_start, self.mult_end)
+        for k in range(5, 13):
+            steps = k - 1
+            avg_needed = target_ratio ** (1.0 / steps)
+            if r_min <= avg_needed <= r_max:
+                return k
+        return max(5, min(12, round(
+            math.log(target_ratio) / math.log((self.mult_start + self.mult_end) / 2)
         )))
-        if self.mult_start > 2.5 and k > 7:
-            k = max(4, math.floor(k * 0.85))
-            self.warnings.append(f"High mult_start. Auto-reduced k to {k}.")
-        return k
 
     def _generate_weights(self, k):
         """Generate player distribution weights for K tiers.
 
-        Three distribution modes available:
-          - power_decay  : Exponential decay — most players in low tiers (pyramid)
-          - linear_decay : Simple staircase — evenly spaced reduction
-          - gaussian_mid : Bell curve — peak in middle tiers
-
-        TO ADD A NEW DISTRIBUTION MODE:
-          1. Add an elif block below with your mode name
-          2. Generate a list of K raw weights (higher = more players)
-          3. The weights are auto-normalized to sum to 1.0
+        Strength-influenced exponential weights — higher tiers get
+        progressively fewer players. The base ratio is nudged by strength
+        so a more aggressive strength also concentrates players more.
 
         Args:
             k (int): Number of tiers
         Returns:
-            list[float]: Normalized weights summing to 1.0
+            list[float]: Raw weights (NOT normalized — used by _allocate_players)
         """
-        if self.mode == "power_decay":
-            decay = max(0.40, min(0.80, 0.85 - (self.strength * 0.10)))
-            raw = [decay ** (k - 1 - i) for i in range(k)]
-        elif self.mode == "linear_decay":
-            raw = list(range(k, 0, -1))
-        elif self.mode == "gaussian_mid":
-            center = k / 2.0
-            raw = [
-                math.exp(-((i - center) ** 2) / (2 * self.strength ** 2))
-                for i in range(1, k + 1)
-            ]
-        else:
-            raise ValueError(f"Invalid mode: {self.mode}")
-        s = sum(raw)
-        return [w / s for w in raw]
+        base_r = 1.45 + (self.strength * 0.15)
+        return [base_r ** i for i in range(k - 2)]
 
     def _allocate_players(self, k):
         """Distribute players across K tiers using weighted allocation.
 
         Steps:
-          1. Start with 1 player per tier (minimum guarantee)
+          1. Pin top tier = 1 player, second-top = 2 players
           2. Distribute remaining players proportional to weights
-          3. Apply top-tier scarcity cap (top 3 tiers combined ≤ max_top)
-          4. Enforce strict monotonic pyramid (each tier ≥ tier above it)
+          3. Enforce strict monotonic pyramid (each tier ≥ tier above it)
 
         Args:
             k (int): Number of tiers
@@ -210,268 +199,155 @@ class BountyArchitect:
             list[int]: Player count per tier (index 0 = lowest, k-1 = highest)
         """
         weights = self._generate_weights(k)
-        counts = [1] * k
-        remaining = self.players - k
+        total_w = sum(weights)
+        counts = [0] * k
+        counts[-1] = 1
+        counts[-2] = 2
+        remaining = self.players - 3
         if remaining <= 0:
             return counts
-        shares = [w * remaining for w in weights]
-        floors = [math.floor(s) for s in shares]
-        counts = [c + f for c, f in zip(counts, floors)]
-        rem = remaining - sum(floors)
-        fractions = [(s - math.floor(s), i) for i, s in enumerate(shares)]
-        fractions.sort(key=lambda x: x[0], reverse=True)
-        for _, i in fractions[:rem]:
+        raw = [(w / total_w) * remaining for w in weights]
+        counts[:k - 2] = [max(1, math.floor(v)) for v in raw]
+        rem = remaining - sum(counts[:k - 2])
+        fractions = [v - math.floor(v) for v in raw]
+        for i in sorted(range(k - 2), key=lambda x: fractions[x], reverse=True)[:rem]:
             counts[i] += 1
-        # Top-tier scarcity cap
-        if k >= 4:
-            top_idx = [k - 1, k - 2, k - 3]
-            top_sum = sum(counts[i] for i in top_idx)
-            if top_sum > self.max_top:
-                top_w = [weights[i] for i in top_idx]
-                top_tw = sum(top_w)
-                new_top = [max(1, round((top_w[i] / top_tw) * self.max_top)) for i in range(len(top_idx))]
-                while sum(new_top) > self.max_top:
-                    max_i = max(range(len(new_top)), key=lambda x: new_top[x])
-                    new_top[max_i] -= 1
-                while sum(new_top) < self.max_top:
-                    min_i = min(range(len(new_top)), key=lambda x: new_top[x])
-                    new_top[min_i] += 1
-                actual_freed = top_sum - sum(new_top)
-                for i, idx in enumerate(top_idx):
-                    counts[idx] = new_top[i]
-                lower_idx = list(range(k - 3))
-                lower_w = [weights[i] for i in lower_idx]
-                lower_tw = sum(lower_w)
-                distributed = 0
-                for i in lower_idx:
-                    add = round((lower_w[i] / lower_tw) * actual_freed)
-                    counts[i] += add
-                    distributed += add
-                leftover = actual_freed - distributed
-                if leftover != 0:
-                    counts[lower_idx[0]] += leftover
-        # Strict monotonic pyramid (swap-only)
+        # Strict Pyramid Enforcement
         for _ in range(k * 20):
             changed = False
             for i in range(k - 1):
                 if counts[i] < counts[i + 1]:
-                    excess = math.ceil((counts[i + 1] - counts[i]) / 2)
-                    if counts[i + 1] - excess >= 1:
-                        counts[i] += excess
-                        counts[i + 1] -= excess
+                    if counts[i + 1] > 1:
+                        counts[i] += 1
+                        counts[i + 1] -= 1
                         changed = True
             if not changed:
                 break
-        for i in range(k):
-            if counts[i] < 1:
-                counts[i] = 1
         return counts
 
-    def _reconcile_pool(self, vals, counts):
-        """Fine-tune bounty values so the total exactly matches the pool.
+    def _generate_ideal_values(self, k):
+        """Generate bounty values with dynamic strength curve.
 
-        Uses integer-cent arithmetic (all values × 100) to avoid floating-point
-        errors. Adjusts middle tiers up/down by denomination steps until the
-        total matches exactly. Falls back to single-cent adjustments, then
-        two-tier adjustments, then player reallocation if needed.
+        Uses a power-curve (t^p) to interpolate multipliers between
+        mult_start and mult_end across K-1 steps. Pins both endpoints,
+        enforces monotonicity, scales to exact min/max span, then
+        compounds into final USDT values.
 
-        This is the most complex method — it ensures $0.00 pool error every time.
+        Strength interpretation:
+          p > 1.0 → flat start, sharp top (late spike)
+          p < 1.0 → sharp start, flat top (early spike)
+          p = 1.0 → linear
 
         Args:
-            vals (list[float])  : Bounty values per tier
-            counts (list[int])  : Player counts per tier
+            k (int): Number of tiers
         Returns:
-            tuple: (adjusted_vals, adjusted_counts, pool_error_in_cents)
+            list[float]: Bounty values per tier (ascending, snapped to denomination)
         """
-        k = len(vals)
-        c_vals = [int(round(v * 100)) for v in vals]
-        target_cents = int(round(self.pool * 100))
-        step_cents = int(round(self.denom * 100))
-        min_c = int(round(self.min_val * 100))
-        max_c = int(round(self.max_val * 100))
-        adjustable = list(range(1, k - 1))
+        steps = k - 1
+        ratios = [0.0] * steps
+        is_descending = (self.mult_start > self.mult_end)
+        r_bound_start = self.mult_start
+        r_bound_end = self.mult_end
 
-        for _pass in range(2):
-            current_step = step_cents if _pass == 0 else 100
-            for _ in range(k * 200):
-                current = sum(v * c for v, c in zip(c_vals, counts))
-                diff = target_cents - current
-                if diff == 0:
-                    break
-                direction = 1 if diff > 0 else -1
-                step = current_step * direction
-                best_idx = None
-                best_remaining = abs(diff)
-                for i in adjustable:
-                    new_val = c_vals[i] + step
-                    lo = c_vals[i - 1] + current_step if i > 0 else min_c
-                    hi = c_vals[i + 1] - current_step if i < k - 1 else max_c
-                    if new_val < min_c or new_val > max_c:
-                        continue
-                    if new_val < lo or new_val > hi:
-                        continue
-                    impact = abs(step * counts[i])
-                    remaining = abs(abs(diff) - impact)
-                    if remaining < best_remaining:
-                        best_remaining = remaining
-                        best_idx = i
-                if best_idx is None:
-                    break
-                c_vals[best_idx] += step
-            current = sum(v * c for v, c in zip(c_vals, counts))
-            if current == target_cents:
-                break
+        # 1. PIN ENDPOINTS
+        ratios[0] = r_bound_start
+        ratios[-1] = r_bound_end
 
-        # Exact close — single tier
-        current = sum(v * c for v, c in zip(c_vals, counts))
-        diff = target_cents - current
-        if diff != 0:
-            for i in adjustable:
-                if counts[i] == 0:
-                    continue
-                if diff % counts[i] == 0:
-                    adj = diff // counts[i]
-                    new_val = c_vals[i] + adj
-                    if min_c <= new_val <= max_c:
-                        ok = True
-                        if i > 0 and new_val <= c_vals[i - 1]:
-                            ok = False
-                        if i < k - 1 and new_val >= c_vals[i + 1]:
-                            ok = False
-                        if ok:
-                            c_vals[i] = new_val
-                            diff = 0
-                            break
+        # 2. GENERATE DYNAMIC STRENGTH CURVE
+        p = self.strength
+        range_diff = r_bound_end - r_bound_start
 
-        # Two-tier exact close
-        if diff != 0:
-            max_delta = max(50, abs(diff) // min(c for c in counts if c > 0) + 5)
-            found = False
-            for a in adjustable:
-                if found:
-                    break
-                for b in adjustable:
-                    if a == b or counts[a] == 0 or counts[b] == 0:
-                        continue
-                    for da in range(0, max_delta):
-                        remainder = diff - da * counts[a]
-                        if remainder == 0:
-                            continue
-                        if counts[b] != 0 and (-remainder) % counts[b] == 0:
-                            db = (-remainder) // counts[b]
-                            if db <= 0:
-                                continue
-                            new_a = c_vals[a] + da
-                            new_b = c_vals[b] - db
-                            if (min_c <= new_a <= max_c and min_c <= new_b <= max_c
-                                    and (a == 0 or new_a > c_vals[a - 1])
-                                    and (a == k - 1 or new_a < c_vals[a + 1])
-                                    and (b == 0 or new_b > c_vals[b - 1])
-                                    and (b == k - 1 or new_b < c_vals[b + 1])):
-                                c_vals[a] = new_a
-                                c_vals[b] = new_b
-                                diff = 0
-                                found = True
-                                break
-                    if found:
-                        break
+        for i in range(1, steps - 1):
+            t = i / (steps - 1)
+            curve_val = range_diff * (t ** p)
+            ratios[i] = r_bound_start + curve_val
 
-        # Player reallocation fallback
-        current = sum(v * c for v, c in zip(c_vals, counts))
-        diff = target_cents - current
-        if diff != 0:
-            best_move = None
-            best_remaining = abs(diff)
-            for i in range(k - 1):
-                if counts[i] <= 1:
-                    continue
-                delta = c_vals[i + 1] - c_vals[i]
-                new_diff = diff - delta
-                if abs(new_diff) < best_remaining:
-                    best_remaining = abs(new_diff)
-                    best_move = (i, i + 1, new_diff)
-                if counts[i + 1] <= 1:
-                    continue
-                delta2 = c_vals[i] - c_vals[i + 1]
-                new_diff2 = diff - delta2
-                if abs(new_diff2) < best_remaining:
-                    best_remaining = abs(new_diff2)
-                    best_move = (i + 1, i, new_diff2)
-            if best_move is not None and best_remaining < abs(diff):
-                src, dst, new_diff = best_move
-                counts[src] -= 1
-                counts[dst] += 1
-                diff = new_diff
-                self.warnings.append(f"Moved 1 player L{src+1}→L{dst+1} for pool fit")
-                if diff != 0:
-                    for i in adjustable:
-                        if counts[i] == 0:
-                            continue
-                        if diff % counts[i] == 0:
-                            adj = diff // counts[i]
-                            new_val = c_vals[i] + adj
-                            if min_c <= new_val <= max_c:
-                                ok = True
-                                if i > 0 and new_val <= c_vals[i - 1]:
-                                    ok = False
-                                if i < k - 1 and new_val >= c_vals[i + 1]:
-                                    ok = False
-                                if ok:
-                                    c_vals[i] = new_val
-                                    diff = 0
-                                    break
+        # 3. ENFORCE BOUNDS & MONOTONICITY
+        safe_min = min(r_bound_start, r_bound_end)
+        safe_max = max(r_bound_start, r_bound_end)
+        ratios = [max(safe_min, min(safe_max, r)) for r in ratios]
 
-        final_vals = [v / 100 for v in c_vals]
-        final_total = sum(v * c for v, c in zip(final_vals, counts))
-        if abs(final_total - self.pool) > 0.005:
-            raise ValueError(f"Pool reconciliation failed: ${final_total:.2f} != ${self.pool:.2f}")
-        return final_vals
+        if is_descending:
+            for i in range(steps - 1, 0, -1):
+                if ratios[i] > ratios[i - 1]:
+                    ratios[i] = ratios[i - 1]
+        else:
+            for i in range(1, steps):
+                if ratios[i] < ratios[i - 1]:
+                    ratios[i] = ratios[i - 1]
+
+        # 4. SCALE TO EXACT SPAN
+        target_prod = self.max_val / self.min_val
+        current_prod = math.prod(ratios)
+        if current_prod > 0:
+            scale_factor = (target_prod / current_prod) ** (1.0 / steps)
+            ratios = [max(safe_min, min(safe_max, r * scale_factor)) for r in ratios]
+
+        # 5. RE-VALIDATE AFTER SCALING
+        ratios = [max(safe_min, min(safe_max, r)) for r in ratios]
+        if is_descending:
+            for i in range(steps - 1, 0, -1):
+                if ratios[i] > ratios[i - 1]:
+                    ratios[i] = ratios[i - 1]
+        else:
+            for i in range(1, steps):
+                if ratios[i] < ratios[i - 1]:
+                    ratios[i] = ratios[i - 1]
+
+        # 6. COMPOUND VALUES
+        vals = [self.min_val]
+        for r in ratios:
+            vals.append(vals[-1] * r)
+        vals = [round(v / self.denom) * self.denom for v in vals]
+        vals[0] = self.min_val
+        vals[-1] = self.max_val
+        # Explicit L2 Pin
+        vals[1] = round(self.min_val * self.mult_start / self.denom) * self.denom
+        # Strictly increasing bounties
+        for i in range(1, k):
+            if vals[i] <= vals[i - 1]:
+                vals[i] = vals[i - 1] + self.denom
+        return vals
 
     def build(self, k=None):
         """Main entry point — build the complete bounty distribution.
 
-        Orchestrates the full pipeline: K recommendation → value generation →
-        player allocation → pool reconciliation.
+        Orchestrates the full pipeline: K recommendation → player allocation →
+        ideal value generation → drift correction.
+
+        Drift correction: adjusts middle tiers by denomination steps to bring
+        the total pool sum as close to the target as possible. Unlike v6's
+        _reconcile_pool, this is a lighter single-pass correction — the
+        ideal values serve as the display reference, and final values are
+        the pool-corrected output.
 
         Args:
             k (int, optional): Override number of tiers. If None, auto-recommends.
         Returns:
-            tuple: (k, vals, counts)
-              - k (int)          : Number of tiers used
-              - vals (list[float]): Bounty value per tier (ascending)
-              - counts (list[int]): Player count per tier (descending)
+            tuple: (k, ideal, final, counts)
+              - k (int)           : Number of tiers used
+              - ideal (list[float]): Ideal bounty values (pre-correction)
+              - final (list[float]): Pool-corrected bounty values
+              - counts (list[int]) : Player count per tier (index 0 = lowest)
         Raises:
             ValueError: If pool cannot be distributed within constraints
         """
         if k is None:
             k = self.recommend_k()
-        multipliers = [
-            self.mult_start + (self.mult_end - self.mult_start) * (i / (k - 1))
-            for i in range(k - 1)
-        ]
-        vals = [self.min_val]
-        for m in multipliers:
-            vals.append(vals[-1] * m)
-        vals = [round(v / self.denom) * self.denom for v in vals]
-        vals[0] = self.min_val
-        vals[-1] = self.max_val
-        if len(vals) > 1 and vals[-2] >= vals[-1]:
-            vals[-2] = vals[-1] - self.denom
-        for i in range(1, len(vals)):
-            if vals[i] <= vals[i - 1]:
-                vals[i] = vals[i - 1] + self.denom
         counts = self._allocate_players(k)
-        vals = self._reconcile_pool(vals, counts)
-        p_sum = sum(counts)
-        pool_sum = sum(v * c for v, c in zip(vals, counts))
-        if p_sum != self.players:
-            raise ValueError(f"Player count mismatch: {p_sum} != {self.players}")
-        if abs(round(pool_sum * 100) / 100 - self.pool) > 0.005:
-            raise ValueError(f"Pool mismatch: ${round(pool_sum, 2)} != ${self.pool}")
-        for i in range(1, len(vals)):
-            if vals[i] <= vals[i - 1]:
-                raise ValueError(f"Value ordering violation at tier {i}")
-        return k, vals, counts
+        ideal = self._generate_ideal_values(k)
+        drift = self.pool - sum(v * c for v, c in zip(ideal, counts))
+        final = list(ideal)
+        if abs(drift) > 0.5:
+            step = self.denom if drift > 0 else -self.denom
+            for i in range(2, k - 2):
+                if abs(drift) < self.denom / 2:
+                    break
+                nv = final[i] + step
+                if self.min_val < nv < self.max_val:
+                    final[i] = nv
+                    drift -= step * counts[i]
+        return k, ideal, final, counts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -506,7 +382,6 @@ def query_metabase(sql: str) -> pd.DataFrame:
     Returns:
         pd.DataFrame: Query results as a DataFrame (empty if error/no results)
     """
-    """Execute SQL against cp_prod via Metabase API."""
     import requests
     headers = get_metabase_session()
     if headers is None:
@@ -617,15 +492,27 @@ st.markdown("""
         background-color: #c1121f !important;
         border-color: #c1121f !important;
     }
+    .engine-badge {
+        display: inline-block;
+        background: linear-gradient(135deg, #1f6feb22, #64ffda22);
+        border: 1px solid #64ffda44;
+        border-radius: 6px;
+        padding: 2px 10px;
+        font-size: 0.75rem;
+        color: #64ffda;
+        font-weight: 600;
+        margin-left: 8px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🎯 Mystery Bounty Simulator")
-st.caption("CoinPoker Internal — Simulate & fine-tune bounty prize distributions")
+st.caption("CoinPoker Internal — Simulate & fine-tune bounty prize distributions · Engine v15")
 
 # ─── SIDEBAR: Engine Parameters ───
 with st.sidebar:
     st.header("⚙️ Engine Parameters")
+    st.caption("BountyArchitect v15 — Dynamic Strength Control")
 
     st.subheader("Distribution Mode")
     mode = st.selectbox(
@@ -635,36 +522,51 @@ with st.sidebar:
     )
     strength = st.slider(
         "Curve strength",
-        min_value=0.5, max_value=3.0, value=1.5, step=0.1,
-        help="Higher = steeper curve. For power_decay: controls decay rate. For gaussian: controls spread.",
+        min_value=0.1, max_value=5.0, value=1.5, step=0.1,
+        help=(
+            "Controls the shape of the multiplier curve:\n"
+            "• > 1.0 = Late spike (flat near start, sharp jump at top)\n"
+            "• < 1.0 = Early spike (sharp jump at start, flat at top)\n"
+            "• = 1.0 = Linear interpolation"
+        ),
     )
+
+    # Strength visual hint
+    if strength > 1.2:
+        st.caption(f"📈 **Late spike** — multipliers accelerate toward top tiers")
+    elif strength < 0.8:
+        st.caption(f"📉 **Early spike** — multipliers jump fast, then flatten")
+    else:
+        st.caption(f"↔️ **Linear** — smooth multiplier progression")
 
     st.subheader("Multiplier Range")
     mult_start = st.slider(
         "Start multiplier (tier-to-tier at bottom)",
-        min_value=1.1, max_value=4.0, value=2.0, step=0.1,
-        help="Ratio between consecutive tiers at the low end",
+        min_value=1.1, max_value=5.0, value=2.0, step=0.1,
+        help="Ratio between consecutive tiers at the low end (L1→L2)",
     )
     mult_end = st.slider(
         "End multiplier (tier-to-tier at top)",
-        min_value=1.1, max_value=4.0, value=1.5, step=0.1,
-        help="Ratio between consecutive tiers at the high end",
+        min_value=1.1, max_value=5.0, value=3.0, step=0.1,
+        help="Ratio between consecutive tiers at the high end (top tiers)",
     )
-    if mult_end > mult_start:
-        st.warning("End multiplier should be ≤ start multiplier. Swapping.")
-        mult_start, mult_end = mult_end, mult_start
+    st.caption(
+        f"Multipliers interpolate {mult_start:.1f}x → {mult_end:.1f}x "
+        f"({'increasing' if mult_end > mult_start else 'decreasing' if mult_end < mult_start else 'flat'}) "
+        f"via strength curve"
+    )
 
     st.subheader("Tier Settings")
     use_auto_k = st.checkbox("Auto-recommend K", value=True)
     manual_k = st.slider(
         "Manual K (number of tiers)",
-        min_value=4, max_value=12, value=7,
+        min_value=5, max_value=12, value=7,
         disabled=use_auto_k,
     )
     max_top = st.slider(
         "Max players in top 3 tiers",
         min_value=3, max_value=20, value=8,
-        help="Scarcity cap: top 3 tiers combined cannot exceed this count",
+        help="Scarcity cap: top 3 tiers combined (top tier is always 1, second is always 2)",
     )
     denomination = st.number_input(
         "Denomination (USDT)",
@@ -700,7 +602,11 @@ if "comparison_runs" not in st.session_state:
 
 
 def run_simulation(pool, players, min_bounty, max_bounty, label=""):
-    """Run the BountyArchitect engine and return results dict."""
+    """Run the BountyArchitect v15 engine and return results dict.
+
+    Returns a dict with both 'ideal' (pre-correction) and 'vals' (pool-corrected)
+    tier values, plus counts, metrics, and engine params.
+    """
     try:
         engine = BountyArchitect(
             pool=pool,
@@ -715,27 +621,35 @@ def run_simulation(pool, players, min_bounty, max_bounty, label=""):
             denomination=denomination,
         )
         k_val = None if use_auto_k else manual_k
-        k, vals, counts = engine.build(k=k_val)
+        k, ideal, final, counts = engine.build(k=k_val)
 
-        # Build results
+        # Use final (pool-corrected) values for the distribution table
         tiers = []
         for i in range(k):
             tiers.append({
                 "Tier": f"L{i+1}",
-                "Bounty (USDT)": vals[i],
+                "Ideal Bounty (USDT)": ideal[i],
+                "Final Bounty (USDT)": final[i],
                 "Players": counts[i],
-                "Subtotal": round(vals[i] * counts[i], 2),
-                "% of Pool": round(vals[i] * counts[i] / pool * 100, 1),
+                "Subtotal": round(final[i] * counts[i], 2),
+                "% of Pool": round(final[i] * counts[i] / pool * 100, 1),
                 "% of Players": round(counts[i] / players * 100, 1),
             })
+
+        # Pool accuracy check
+        pool_total = sum(v * c for v, c in zip(final, counts))
+        pool_error = abs(pool_total - pool)
 
         result = {
             "label": label,
             "k": k,
-            "vals": vals,
+            "ideal": ideal,
+            "vals": final,       # pool-corrected — used for charts
             "counts": counts,
             "tiers": tiers,
             "pool": pool,
+            "pool_total": round(pool_total, 2),
+            "pool_error": round(pool_error, 2),
             "players": players,
             "min_bounty": min_bounty,
             "max_bounty": max_bounty,
@@ -760,10 +674,12 @@ def render_results(result):
 
     df = pd.DataFrame(result["tiers"])
     vals = result["vals"]
+    ideal = result.get("ideal", vals)
     counts = result["counts"]
     pool = result["pool"]
     players = result["players"]
     k = result["k"]
+    pool_error = result.get("pool_error", 0)
 
     # ── Key Metrics ──
     avg_bounty = pool / players
@@ -777,7 +693,6 @@ def render_results(result):
     median_bounty = vals[median_idx]
     max_ratio = vals[-1] / vals[0]
     top3_pct = sum(counts[-3:]) / players * 100 if k >= 3 else 0
-    top3_pool_pct = sum(v * c for v, c in zip(vals[-3:], counts[-3:])) / pool * 100
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Tiers (K)", k)
@@ -786,24 +701,48 @@ def render_results(result):
     col4.metric("Max/Min Ratio", f"{max_ratio:,.1f}x")
     col5.metric("Top 3 Tiers", f"{sum(counts[-3:])} players ({top3_pct:.0f}%)")
 
+    # Pool accuracy info
+    if pool_error > 0.01:
+        st.info(
+            f"ℹ️ **Pool drift:** ${pool_error:.2f} USDT — Final pool total is "
+            f"${result['pool_total']:,.2f} vs target ${pool:,.2f}. "
+            f"Middle tiers were adjusted by denomination steps to correct. "
+            f"Ideal values (pre-correction) are shown in the table."
+        )
+
     # ── Charts ──
     chart_col1, chart_col2 = st.columns(2)
 
     with chart_col1:
-        # Bounty value bar chart
+        # Bounty value bar chart — show both ideal and final if they differ
         fig_vals = go.Figure()
         colors = px.colors.sequential.Teal
         n_colors = len(colors)
         tier_colors = [colors[min(i * n_colors // k, n_colors - 1)] for i in range(k)]
+        tier_labels = [f"L{i+1}" for i in range(k)]
 
         fig_vals.add_trace(go.Bar(
-            x=[f"L{i+1}" for i in range(k)],
+            name="Final (pool-corrected)",
+            x=tier_labels,
             y=vals,
             marker_color=tier_colors,
             text=[f"${v:,.2f}" for v in vals],
             textposition="outside",
-            hovertemplate="<b>%{x}</b><br>Bounty: $%{y:,.2f}<extra></extra>",
+            hovertemplate="<b>%{x}</b><br>Final: $%{y:,.2f}<extra></extra>",
         ))
+
+        # Overlay ideal as a line if it differs meaningfully from final
+        if any(abs(a - b) > 0.01 for a, b in zip(ideal, vals)):
+            fig_vals.add_trace(go.Scatter(
+                name="Ideal (pre-correction)",
+                x=tier_labels,
+                y=ideal,
+                mode="lines+markers",
+                line=dict(color="#f0883e", width=2, dash="dot"),
+                marker=dict(size=6, color="#f0883e"),
+                hovertemplate="<b>%{x}</b><br>Ideal: $%{y:,.2f}<extra></extra>",
+            ))
+
         fig_vals.update_layout(
             title="Bounty Values by Tier",
             xaxis_title="Tier",
@@ -811,6 +750,7 @@ def render_results(result):
             template="plotly_dark",
             height=400,
             margin=dict(t=60, b=40),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         st.plotly_chart(fig_vals, use_container_width=True)
 
@@ -836,6 +776,43 @@ def render_results(result):
         )
         st.plotly_chart(fig_players, use_container_width=True)
 
+    # ── Multiplier progression chart ──
+    if k >= 3:
+        multipliers = [vals[i] / vals[i - 1] for i in range(1, k)]
+        ideal_multipliers = [ideal[i] / ideal[i - 1] for i in range(1, k)]
+        fig_mult = go.Figure()
+        fig_mult.add_trace(go.Scatter(
+            x=[f"L{i}→L{i+1}" for i in range(1, k)],
+            y=multipliers,
+            mode="lines+markers",
+            name="Final multipliers",
+            line=dict(color="#64ffda", width=2),
+            marker=dict(size=8),
+            hovertemplate="<b>%{x}</b><br>Multiplier: %{y:.3f}x<extra></extra>",
+        ))
+        fig_mult.add_trace(go.Scatter(
+            x=[f"L{i}→L{i+1}" for i in range(1, k)],
+            y=ideal_multipliers,
+            mode="lines+markers",
+            name="Ideal multipliers",
+            line=dict(color="#f0883e", width=2, dash="dot"),
+            marker=dict(size=6),
+            hovertemplate="<b>%{x}</b><br>Ideal mult: %{y:.3f}x<extra></extra>",
+        ))
+        fig_mult.add_hline(y=mult_start, line_dash="dash", line_color="#8892b0",
+                           annotation_text=f"mult_start={mult_start:.1f}x", annotation_position="left")
+        fig_mult.add_hline(y=mult_end, line_dash="dash", line_color="#8892b0",
+                           annotation_text=f"mult_end={mult_end:.1f}x", annotation_position="left")
+        fig_mult.update_layout(
+            title=f"Tier-to-Tier Multiplier Progression (strength={strength:.1f})",
+            xaxis_title="Tier Transition",
+            yaxis_title="Multiplier",
+            template="plotly_dark",
+            height=300,
+            margin=dict(t=60, b=40),
+        )
+        st.plotly_chart(fig_mult, use_container_width=True)
+
     # ── Pool distribution pie ──
     subtotals = [round(v * c, 2) for v, c in zip(vals, counts)]
     fig_pie = go.Figure(data=[go.Pie(
@@ -858,7 +835,8 @@ def render_results(result):
     st.subheader("Distribution Table")
     st.dataframe(
         df.style.format({
-            "Bounty (USDT)": "${:,.2f}",
+            "Ideal Bounty (USDT)": "${:,.2f}",
+            "Final Bounty (USDT)": "${:,.2f}",
             "Subtotal": "${:,.2f}",
             "% of Pool": "{:.1f}%",
             "% of Players": "{:.1f}%",
@@ -867,15 +845,11 @@ def render_results(result):
         hide_index=True,
     )
 
-    total_row = {
-        "Tier": "TOTAL",
-        "Bounty (USDT)": "",
-        "Players": players,
-        "Subtotal": pool,
-        "% of Pool": 100.0,
-        "% of Players": 100.0,
-    }
-    st.caption(f"**Total: {players} players, ${pool:,.2f} USDT pool**")
+    st.caption(
+        f"**Total: {players} players, ${pool:,.2f} USDT target pool, "
+        f"${result['pool_total']:,.2f} actual pool** "
+        f"{'(exact match ✅)' if pool_error < 0.01 else f'(drift: ${pool_error:.2f})'}"
+    )
 
     # Warnings
     if result["warnings"]:
@@ -904,7 +878,7 @@ with tab_manual:
         pool = st.number_input("Prize Pool (USDT)", min_value=100, max_value=1_000_000, value=20000, step=1000)
         min_bounty = st.number_input("Min Bounty (USDT)", min_value=1.0, max_value=10000.0, value=10.0, step=1.0)
     with mcol2:
-        players = st.number_input("Players", min_value=4, max_value=10000, value=180, step=10)
+        players = st.number_input("Players", min_value=5, max_value=10000, value=180, step=10)
         max_bounty = st.number_input("Max Bounty (USDT)", min_value=10.0, max_value=100000.0, value=2000.0, step=100.0)
 
     run_btn = st.button("🚀 Run Simulation", type="primary", use_container_width=True)
@@ -923,9 +897,16 @@ with tab_manual:
                 st.download_button("📥 Download CSV", csv, "bounty_distribution.csv", "text/csv")
             with exp_col2:
                 json_str = json.dumps({
-                    "k": result["k"], "vals": result["vals"], "counts": result["counts"],
-                    "pool": result["pool"], "players": result["players"],
-                    "params": result["params"], "warnings": result["warnings"],
+                    "k": result["k"],
+                    "ideal": result["ideal"],
+                    "vals": result["vals"],
+                    "counts": result["counts"],
+                    "pool": result["pool"],
+                    "pool_total": result["pool_total"],
+                    "pool_error": result["pool_error"],
+                    "players": result["players"],
+                    "params": result["params"],
+                    "warnings": result["warnings"],
                 }, indent=2)
                 st.download_button("📥 Download JSON", json_str, "bounty_config.json", "application/json")
             with exp_col3:
@@ -952,7 +933,7 @@ with tab_metabase:
         with lcol2:
             end_date = st.date_input("End date", value=date.today())
         with lcol3:
-            min_player_filter = st.number_input("Min players", min_value=4, max_value=500, value=20)
+            min_player_filter = st.number_input("Min players", min_value=5, max_value=500, value=20)
         with lcol4:
             bounty_only = st.checkbox("Bounty tournaments only", value=True,
                                        help="Filter to tournaments with bounty_amount > 0 (PKO, CoinHunter, etc.)")
@@ -1081,10 +1062,17 @@ with tab_metabase:
                         json_str = json.dumps({
                             "tournament_id": int(selected_row['tournament_id']),
                             "tournament_name": selected_row['tournament_name'],
-                            "k": result["k"], "vals": result["vals"], "counts": result["counts"],
-                            "pool": result["pool"], "players": result["players"],
+                            "k": result["k"],
+                            "ideal": result["ideal"],
+                            "vals": result["vals"],
+                            "counts": result["counts"],
+                            "pool": result["pool"],
+                            "pool_total": result["pool_total"],
+                            "pool_error": result["pool_error"],
+                            "players": result["players"],
                             "original_bounty_amount": bounty_amt,
-                            "params": result["params"], "warnings": result["warnings"],
+                            "params": result["params"],
+                            "warnings": result["warnings"],
                         }, indent=2)
                         st.download_button("📥 Download JSON", json_str, "bounty_config.json",
                                            "application/json", key="json_mb")
@@ -1133,7 +1121,7 @@ with tab_compare:
         m4.metric("Top-3 Players",
                    f"{sum(run_a['counts'][-3:])} vs {sum(run_b['counts'][-3:])}")
 
-        # Overlay chart
+        # Overlay chart — bounty values
         fig_compare = go.Figure()
         fig_compare.add_trace(go.Bar(
             name=f"A: {run_a.get('label', 'Run A')}",
@@ -1156,6 +1144,34 @@ with tab_compare:
             height=400,
         )
         st.plotly_chart(fig_compare, use_container_width=True)
+
+        # Multiplier comparison chart
+        if run_a['k'] >= 3 and run_b['k'] >= 3:
+            mults_a = [run_a['vals'][i] / run_a['vals'][i-1] for i in range(1, run_a['k'])]
+            mults_b = [run_b['vals'][i] / run_b['vals'][i-1] for i in range(1, run_b['k'])]
+            fig_mults = go.Figure()
+            fig_mults.add_trace(go.Scatter(
+                name=f"A: {run_a.get('label', 'Run A')}",
+                x=[f"L{i}→L{i+1}" for i in range(1, run_a['k'])],
+                y=mults_a,
+                mode="lines+markers",
+                line=dict(color="#58a6ff", width=2),
+            ))
+            fig_mults.add_trace(go.Scatter(
+                name=f"B: {run_b.get('label', 'Run B')}",
+                x=[f"L{i}→L{i+1}" for i in range(1, run_b['k'])],
+                y=mults_b,
+                mode="lines+markers",
+                line=dict(color="#f0883e", width=2),
+            ))
+            fig_mults.update_layout(
+                title="Multiplier Progression Comparison",
+                xaxis_title="Tier Transition",
+                yaxis_title="Multiplier",
+                template="plotly_dark",
+                height=300,
+            )
+            st.plotly_chart(fig_mults, use_container_width=True)
 
         # Parameter diff table
         st.subheader("Parameter Comparison")
@@ -1193,9 +1209,9 @@ EDITABLE_SECTIONS = [
     ("📊 Distribution Weights (_generate_weights)",
      "    def _generate_weights(self, k):", "    def _allocate_players(self, k):"),
     ("👥 Player Allocation (_allocate_players)",
-     "    def _allocate_players(self, k):", "    def _reconcile_pool(self, vals, counts):"),
-    ("💰 Pool Reconciliation (_reconcile_pool)",
-     "    def _reconcile_pool(self, vals, counts):", "    def build(self, k=None):"),
+     "    def _allocate_players(self, k):", "    def _generate_ideal_values(self, k):"),
+    ("💡 Ideal Value Generation (_generate_ideal_values)",
+     "    def _generate_ideal_values(self, k):", "    def build(self, k=None):"),
     ("🏗️ Build Pipeline (build)",
      "    def build(self, k=None):", "\n\n# ─────"),
     ("🔌 SQL: Bounty Tournament Query",
