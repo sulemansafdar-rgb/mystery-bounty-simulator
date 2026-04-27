@@ -2,14 +2,11 @@
 Mystery Bounty Simulator — CoinPoker Internal Tool
 ====================================================
 Streamlit app for simulating and fine-tuning mystery bounty prize distributions.
-
 Usage:
     pip install streamlit pandas plotly requests
     streamlit run mystery_bounty_app.py
-
 Metabase integration: loads real tournament data from cp_prod (DB 133, Athena)
 to simulate mystery bounty distributions on actual CoinPoker tournaments.
-
 TABLE OF CONTENTS (search for these section headers to jump around):
 =====================================================================
   SECTION 1: ENGINE — BountyArchitect v15      (line ~35)
@@ -19,45 +16,36 @@ TABLE OF CONTENTS (search for these section headers to jump around):
       - _allocate_players     : Assign players to tiers with pyramid enforcement
       - _generate_ideal_values: Generate bounty values with dynamic strength curve
       - build                 : Main entry point — orchestrates the full pipeline
-
   SECTION 2: METABASE INTEGRATION               (line ~300)
       - query_metabase  : Execute SQL against cp_prod via Metabase API
       - BOUNTY_TOURNAMENT_QUERY : SQL for PKO/bounty tournaments
       - ALL_TOURNAMENT_QUERY    : SQL for all tournaments
-
   SECTION 3: STREAMLIT APP CONFIG & CSS          (line ~380)
       - Page config, theme, custom CSS styles
       - TO CHANGE BUTTON COLOR: search for "Red Run Simulation button"
       - TO CHANGE THEME COLORS: edit the .streamlit/config.toml file
-
   SECTION 4: SIDEBAR — Engine Parameters         (line ~415)
       - Distribution mode selector (power_decay, linear_decay, gaussian_mid)
       - Curve strength, multiplier range, tier settings
       - Metabase API key connection (auto-loads from Streamlit secrets)
-
   SECTION 5: SIMULATION & RENDERING FUNCTIONS    (line ~490)
       - run_simulation  : Wraps BountyArchitect and returns results dict
       - render_results  : Displays charts, metrics, and distribution table
-
   SECTION 6: TAB 1 — Manual Simulator            (line ~685)
       - User inputs: pool, players, min/max bounty
       - Run button, export (CSV/JSON), save to comparison
-
   SECTION 7: TAB 2 — Load from CoinPoker         (line ~730)
       - Fetches real tournament data from Metabase
       - Tournament picker, pool source modes, simulation
-
   SECTION 8: TAB 3 — Compare Runs                (line ~890)
       - Side-by-side comparison of saved simulation runs
       - Overlay charts and parameter diff table
-
 CONFIGURATION:
 ==============
   - Metabase API Key : Set in Streamlit Cloud Secrets (METABASE_API_KEY)
   - Database         : cp_prod (DB ID 133, Athena engine)
   - Data source table: lakehouse_gold.user_tournament_play_history
   - lobby_id = 9     : Excluded (freerolls, not real-money tournaments)
-
 ENGINE v15 NOTES — Dynamic Strength Control:
   - strength > 1.0 = 'Late' Spike/Drop (flat near start, sharp move at top)
   - strength < 1.0 = 'Early' Spike/Drop (sharp move at start, flat near end)
@@ -98,7 +86,6 @@ import plotly.express as px
 
 class BountyArchitect:
     """Mystery Bounty prize distribution engine v15.
-
     Final Unified Engine with Dynamic Strength Control for Multiplier Curves.
     Generates a complete prize distribution table for mystery bounty tournaments.
 
@@ -149,7 +136,6 @@ class BountyArchitect:
 
     def recommend_k(self):
         """Auto-calculate the optimal number of tiers (K).
-
         Finds K where the geometric mean of the span fits strictly between
         mult_start and mult_end, allowing for smooth interpolation.
         Falls back to log-based estimate if no clean fit is found.
@@ -172,7 +158,6 @@ class BountyArchitect:
 
     def _generate_weights(self, k):
         """Generate player distribution weights for K tiers.
-
         Strength-influenced exponential weights — higher tiers get
         progressively fewer players. The base ratio is nudged by strength
         so a more aggressive strength also concentrates players more.
@@ -187,7 +172,6 @@ class BountyArchitect:
 
     def _allocate_players(self, k):
         """Distribute players across K tiers using weighted allocation.
-
         Steps:
           1. Pin top tier = 1 player, second-top = 2 players
           2. Distribute remaining players proportional to weights
@@ -227,7 +211,6 @@ class BountyArchitect:
 
     def _generate_ideal_values(self, k):
         """Generate bounty values with dynamic strength curve.
-
         Uses a power-curve (t^p) to interpolate multipliers between
         mult_start and mult_end across K-1 steps. Pins both endpoints,
         enforces monotonicity, scales to exact min/max span, then
@@ -256,7 +239,6 @@ class BountyArchitect:
         # 2. GENERATE DYNAMIC STRENGTH CURVE
         p = self.strength
         range_diff = r_bound_end - r_bound_start
-
         for i in range(1, steps - 1):
             t = i / (steps - 1)
             curve_val = range_diff * (t ** p)
@@ -266,7 +248,6 @@ class BountyArchitect:
         safe_min = min(r_bound_start, r_bound_end)
         safe_max = max(r_bound_start, r_bound_end)
         ratios = [max(safe_min, min(safe_max, r)) for r in ratios]
-
         if is_descending:
             for i in range(steps - 1, 0, -1):
                 if ratios[i] > ratios[i - 1]:
@@ -301,8 +282,10 @@ class BountyArchitect:
         vals = [round(v / self.denom) * self.denom for v in vals]
         vals[0] = self.min_val
         vals[-1] = self.max_val
+
         # Explicit L2 Pin
         vals[1] = round(self.min_val * self.mult_start / self.denom) * self.denom
+
         # Strictly increasing bounties
         for i in range(1, k):
             if vals[i] <= vals[i - 1]:
@@ -311,7 +294,6 @@ class BountyArchitect:
 
     def build(self, k=None):
         """Main entry point — build the complete bounty distribution.
-
         Orchestrates the full pipeline: K recommendation → player allocation →
         ideal value generation → drift correction.
 
@@ -603,7 +585,6 @@ if "comparison_runs" not in st.session_state:
 
 def run_simulation(pool, players, min_bounty, max_bounty, label=""):
     """Run the BountyArchitect v15 engine and return results dict.
-
     Returns a dict with both 'ideal' (pre-correction) and 'vals' (pool-corrected)
     tier values, plus counts, metrics, and engine params.
     """
@@ -780,6 +761,7 @@ def render_results(result):
     if k >= 3:
         multipliers = [vals[i] / vals[i - 1] for i in range(1, k)]
         ideal_multipliers = [ideal[i] / ideal[i - 1] for i in range(1, k)]
+
         fig_mult = go.Figure()
         fig_mult.add_trace(go.Scatter(
             x=[f"L{i}→L{i+1}" for i in range(1, k)],
@@ -1149,6 +1131,7 @@ with tab_compare:
         if run_a['k'] >= 3 and run_b['k'] >= 3:
             mults_a = [run_a['vals'][i] / run_a['vals'][i-1] for i in range(1, run_a['k'])]
             mults_b = [run_b['vals'][i] / run_b['vals'][i-1] for i in range(1, run_b['k'])]
+
             fig_mults = go.Figure()
             fig_mults.add_trace(go.Scatter(
                 name=f"A: {run_a.get('label', 'Run A')}",
