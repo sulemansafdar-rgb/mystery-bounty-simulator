@@ -1,55 +1,17 @@
 """
 Mystery Bounty Simulator — CoinPoker Internal Tool
 ====================================================
-Streamlit app for simulating and fine-tuning mystery bounty prize distributions.
+Streamlit app for simulating mystery bounty prize distributions.
+
 Usage:
     pip install streamlit pandas plotly requests
     streamlit run mystery_bounty_app.py
+
+Engine: BountyArchitect v18 — Power-Curve with Auto-Optimisation
+Inputs: pool, players, min_bounty, max_bounty, start_multiplier
+Engine auto-discovers: K, end_multiplier, top-tier pattern, count shape
+
 Metabase integration: loads real tournament data from cp_prod (DB 133, Athena)
-to simulate mystery bounty distributions on actual CoinPoker tournaments.
-TABLE OF CONTENTS (search for these section headers to jump around):
-=====================================================================
-  SECTION 1: ENGINE — BountyArchitect v15      (line ~35)
-      - __init__              : Input validation & parameter storage
-      - recommend_k           : Auto-calculate optimal number of tiers
-      - _generate_weights     : Player distribution weights (strength-influenced)
-      - _allocate_players     : Assign players to tiers with pyramid enforcement
-      - _generate_ideal_values: Generate bounty values with dynamic strength curve
-      - build                 : Main entry point — orchestrates the full pipeline
-  SECTION 2: METABASE INTEGRATION               (line ~300)
-      - query_metabase  : Execute SQL against cp_prod via Metabase API
-      - BOUNTY_TOURNAMENT_QUERY : SQL for PKO/bounty tournaments
-      - ALL_TOURNAMENT_QUERY    : SQL for all tournaments
-  SECTION 3: STREAMLIT APP CONFIG & CSS          (line ~380)
-      - Page config, theme, custom CSS styles
-      - TO CHANGE BUTTON COLOR: search for "Red Run Simulation button"
-      - TO CHANGE THEME COLORS: edit the .streamlit/config.toml file
-  SECTION 4: SIDEBAR — Engine Parameters         (line ~415)
-      - Distribution mode selector (power_decay, linear_decay, gaussian_mid)
-      - Curve strength, multiplier range, tier settings
-      - Metabase API key connection (auto-loads from Streamlit secrets)
-  SECTION 5: SIMULATION & RENDERING FUNCTIONS    (line ~490)
-      - run_simulation  : Wraps BountyArchitect and returns results dict
-      - render_results  : Displays charts, metrics, and distribution table
-  SECTION 6: TAB 1 — Manual Simulator            (line ~685)
-      - User inputs: pool, players, min/max bounty
-      - Run button, export (CSV/JSON), save to comparison
-  SECTION 7: TAB 2 — Load from CoinPoker         (line ~730)
-      - Fetches real tournament data from Metabase
-      - Tournament picker, pool source modes, simulation
-  SECTION 8: TAB 3 — Compare Runs                (line ~890)
-      - Side-by-side comparison of saved simulation runs
-      - Overlay charts and parameter diff table
-CONFIGURATION:
-==============
-  - Metabase API Key : Set in Streamlit Cloud Secrets (METABASE_API_KEY)
-  - Database         : cp_prod (DB ID 133, Athena engine)
-  - Data source table: lakehouse_gold.user_tournament_play_history
-  - lobby_id = 9     : Excluded (freerolls, not real-money tournaments)
-ENGINE v15 NOTES — Dynamic Strength Control:
-  - strength > 1.0 = 'Late' Spike/Drop (flat near start, sharp move at top)
-  - strength < 1.0 = 'Early' Spike/Drop (sharp move at start, flat near end)
-  - strength = 1.0 = Linear interpolation
 """
 
 import math
@@ -62,285 +24,459 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: ENGINE — BountyArchitect v15
+# SECTION 1: ENGINE — BountyArchitect v18 (Power-Curve)
 # ═══════════════════════════════════════════════════════════════════════════════
-# Final Unified Engine v15: Dynamic Strength Control for Multiplier Curves.
 #
-# HOW IT WORKS (high level):
-#   1. recommend_k()            → Decide how many tiers (K) based on multiplier fit
-#   2. _generate_ideal_values() → Generate bounty values with dynamic strength curve
-#   3. _allocate_players()      → Distribute players across tiers (pyramid shape)
-#   4. build()                  → Drift-correct values so total ≈ pool amount
+# HOW IT WORKS:
+#   1. User provides 5 inputs: pool, players, min, max, start_multiplier
+#   2. Engine searches over (K, alpha, top_pattern, count_steepness, min_flex,
+#      max_flex) to find the distribution that best satisfies all conditions:
+#        C1: Hard rules — top tier = 1 player, values increasing, counts decreasing
+#        C2: Pool match — total ≈ prize pool (< 3% drift, then fine-tuned)
+#        C3: Count shape — linear at top (1,3,6 style), smooth decay to L1
+#        C4: Value ratios — monotonically increasing from ~start_mult upward
+#   3. Values use power-curve: v(t) = min × (max/min)^(t^α), α > 1 gives
+#      increasing ratios naturally.
+#   4. Counts use top-pattern + smooth exponential decay for lower tiers.
 #
-# STRENGTH PARAMETER:
-#   strength > 1.0 = 'Late' Spike/Drop (stays flat near start, sharp move at top)
-#   strength < 1.0 = 'Early' Spike/Drop (sharp move at start, stays flat near end)
-#   strength = 1.0 = Linear
-#
-# TO MODIFY THE DISTRIBUTION SHAPE:
-#   - Change _generate_weights() to alter how players are spread across tiers
-#   - Change _generate_ideal_values() to alter how bounty amounts grow tier-to-tier
-#   - Change max_top_tier_count to limit how many players get top prizes
+# PARAMETER RELAXATION (built into engine, not user-facing):
+#   - Min bounty: ±10% of user input
+#   - Max bounty: ±20% of user input
+#   - Start multiplier: ±10% of user input
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BountyArchitect:
-    """Mystery Bounty prize distribution engine v15.
-    Final Unified Engine with Dynamic Strength Control for Multiplier Curves.
-    Generates a complete prize distribution table for mystery bounty tournaments.
+    """Mystery Bounty prize distribution engine v18 — Power-Curve.
+
+    Generates a complete prize distribution with increasing value ratios,
+    smooth count decay, and linear top-tier counts.
 
     Parameters:
-        pool (float)            : Total bounty pool in USDT
-        players (int)           : Number of players receiving bounties
-        min_bounty (float)      : Smallest possible bounty prize
-        max_bounty (float)      : Largest possible bounty prize (jackpot)
-        mult_start (float)      : Tier-to-tier ratio at the low end (default 2.0)
-        mult_end (float)        : Tier-to-tier ratio at the high end (default 3.0)
-        mode (str)              : Distribution curve — "power_decay", "linear_decay", or "gaussian_mid"
-        strength (float)        : Controls curve shape:
-                                    > 1.0 = Late spike (flat start, sharp top)
-                                    < 1.0 = Early spike (sharp start, flat top)
-                                    = 1.0 = Linear
-        max_top_tier_count (int): Max players allowed in top 3 tiers combined
-        denomination (int)      : Values snap to this grid (e.g. 5 → $5, $10, $15...)
-
-    Example:
-        engine = BountyArchitect(pool=10000, players=100, min_bounty=10, max_bounty=1000)
-        k, ideal, final, counts = engine.build()
+        pool (float)       : Total bounty pool in USDT
+        players (int)      : Number of players receiving bounties
+        min_bounty (float) : Target smallest bounty (engine may flex ±10%)
+        max_bounty (float) : Target largest bounty (engine may flex ±20%)
+        mult_start (float) : Target starting multiplier (engine may flex ±10%)
     """
 
-    def __init__(self, pool, players, min_bounty, max_bounty,
-                 mult_start=2.0, mult_end=3.0, mode="power_decay",
-                 strength=1.5, max_top_tier_count=8, denomination=10):
+    DENOM = 10  # Values snap to nearest $10
+
+    # Top-tier count patterns to search (reversed: [top, 2nd, 3rd])
+    TOP_PATTERNS = [
+        [1, 2, 3], [1, 2, 4], [1, 2, 5], [1, 2, 6],
+        [1, 3, 5], [1, 3, 6], [1, 3, 7], [1, 3, 8],
+        [1, 4, 7], [1, 4, 8],
+    ]
+
+    def __init__(self, pool, players, min_bounty, max_bounty, mult_start=2.0):
         if pool <= 0 or players <= 0:
             raise ValueError("Pool and players must be > 0")
         if players * min_bounty > pool:
             raise ValueError("Pool cannot cover min_bounty × players")
         if max_bounty <= min_bounty:
             raise ValueError("max_bounty must be > min_bounty")
-        if max_top_tier_count < 3:
-            raise ValueError("max_top_tier_count must be >= 3")
-        if strength <= 0:
-            raise ValueError("Strength must be > 0")
+
         self.pool = pool
         self.players = players
         self.min_val = min_bounty
         self.max_val = max_bounty
         self.mult_start = mult_start
-        self.mult_end = mult_end
-        self.mode = mode
-        self.strength = strength
-        self.max_top = max_top_tier_count
-        self.denom = denomination
         self.warnings = []
 
-    def recommend_k(self):
-        """Auto-calculate the optimal number of tiers (K).
-        Finds K where the geometric mean of the span fits strictly between
-        mult_start and mult_end, allowing for smooth interpolation.
-        Falls back to log-based estimate if no clean fit is found.
-        Clamped to 5-12 range.
+    # ── Value generation via power curve ──────────────────────────────────
 
-        Returns:
-            int: Recommended number of tiers (K)
+    def _power_curve_values(self, k, mn, mx, alpha):
+        """Generate bounty values using v(t) = mn × (mx/mn)^(t^α).
+
+        α > 1 produces increasing tier-to-tier ratios (slow start,
+        fast finish), which is the desired shape.
+
+        Returns list of k values snapped to DENOM, or None if invalid.
         """
-        target_ratio = self.max_val / self.min_val
-        r_min = min(self.mult_start, self.mult_end)
-        r_max = max(self.mult_start, self.mult_end)
-        for k in range(5, 13):
-            steps = k - 1
-            avg_needed = target_ratio ** (1.0 / steps)
-            if r_min <= avg_needed <= r_max:
-                return k
-        return max(5, min(12, round(
-            math.log(target_ratio) / math.log((self.mult_start + self.mult_end) / 2)
-        )))
+        d = self.DENOM
+        vals = []
+        for i in range(k):
+            t = i / (k - 1) if k > 1 else 0
+            v = mn * (mx / mn) ** (t ** alpha)
+            v = round(v / d) * d
+            vals.append(v)
+        vals[0] = mn
+        vals[-1] = mx
 
-    def _generate_weights(self, k):
-        """Generate player distribution weights for K tiers.
-        Strength-influenced exponential weights — higher tiers get
-        progressively fewer players. The base ratio is nudged by strength
-        so a more aggressive strength also concentrates players more.
+        # Fix non-strictly-increasing after rounding
+        for i in range(1, k):
+            if vals[i] <= vals[i - 1]:
+                vals[i] = vals[i - 1] + d
+
+        # Validate final value didn't drift too far from max
+        if vals[-1] != mx:
+            vals[-1] = mx
+            if vals[-1] <= vals[-2]:
+                return None
+
+        return vals
+
+    # ── Count generation ─────────────────────────────────────────────────
+
+    def _build_counts(self, k, top_pattern, steep):
+        """Build player counts: top tiers from pattern, rest via smooth decay.
 
         Args:
-            k (int): Number of tiers
-        Returns:
-            list[float]: Raw weights (NOT normalized — used by _allocate_players)
-        """
-        base_r = 1.45 + (self.strength * 0.15)
-        return [base_r ** i for i in range(k - 2)]
+            k: number of tiers
+            top_pattern: e.g. [1, 3, 6] for top-3 tier counts
+            steep: multiplier for count growth going downward (1.3-2.7)
 
-    def _allocate_players(self, k):
-        """Distribute players across K tiers using weighted allocation.
-        Steps:
-          1. Pin top tier = 1 player, second-top = 2 players
-          2. Distribute remaining players proportional to weights
-          3. Enforce strict monotonic pyramid (each tier ≥ tier above it)
-
-        Args:
-            k (int): Number of tiers
-        Returns:
-            list[int]: Player count per tier (index 0 = lowest, k-1 = highest)
+        Returns list of k counts, or None if invalid.
         """
-        weights = self._generate_weights(k)
-        total_w = sum(weights)
+        if k <= len(top_pattern):
+            return None
+
+        counts = [0] * k
+        for j, c in enumerate(top_pattern):
+            counts[k - 1 - j] = c
+
+        # Build remaining tiers downward with smooth growth
+        for i in range(k - len(top_pattern) - 1, -1, -1):
+            above = counts[i + 1]
+            counts[i] = max(above + 1, round(above * steep))
+
+        # Adjust L1 to hit exact player count
+        diff = self.players - sum(counts)
+        counts[0] += diff
+
+        # Validate
+        if counts[0] <= 0 or counts[0] <= counts[1]:
+            return None
+        if any(counts[i] <= counts[i + 1] for i in range(k - 1)):
+            return None
+
+        return counts
+
+    # ── Scoring ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _score(vals, counts, pool, mult_start_target):
+        """Score a candidate distribution. Lower is better.
+
+        Components:
+          - Pool drift (most important)
+          - Ratio monotonicity (must be increasing)
+          - First ratio deviation from target start_mult
+          - Count cliff factor (L1/L2 vs L2/L3 ratio)
+        """
+        k = len(vals)
+        total = sum(v * c for v, c in zip(vals, counts))
+        drift = abs(pool - total) / pool * 100
+
+        ratios = [vals[i + 1] / vals[i] for i in range(k - 1)]
+
+        # Count ratio decreases (should be 0 for increasing ratios)
+        n_dec = sum(1 for i in range(len(ratios) - 1)
+                    if ratios[i + 1] < ratios[i] - 0.02)
+
+        # First ratio deviation from target
+        first_dev = abs(ratios[0] - mult_start_target)
+
+        # Count cliff: L1/L2 vs L2/L3
+        r12 = counts[0] / counts[1] if counts[1] > 0 else 999
+        r23 = counts[1] / counts[2] if counts[2] > 0 else 999
+        cliff = r12 / r23 if r23 > 0 else 999
+
+        score = (drift * 15
+                 + n_dec * 80
+                 + first_dev * 15
+                 + max(0, cliff - 2.5) * 30)
+
+        return score, drift, ratios, n_dec
+
+    # ── Fine-tune pool drift ─────────────────────────────────────────────
+
+    def _fine_tune(self, vals, counts):
+        """Nudge middle-tier values by DENOM steps to reduce pool drift.
+
+        Preserves both value ordering AND ratio monotonicity.
+        """
+        d = self.DENOM
+        k = len(vals)
+        final = list(vals)
+        drift = self.pool - sum(v * c for v, c in zip(final, counts))
+
+        def _ratios_ok(v, idx):
+            """Check that ratios around idx stay monotonically non-decreasing."""
+            for j in range(max(0, idx - 1), min(len(v) - 1, idx + 1)):
+                r_here = v[j + 1] / v[j]
+                if j > 0:
+                    r_prev = v[j] / v[j - 1]
+                    if r_here < r_prev - 0.005:
+                        return False
+                if j + 2 < len(v):
+                    r_next = v[j + 2] / v[j + 1]
+                    if r_next < r_here - 0.005:
+                        return False
+            return True
+
+        for _ in range(500):
+            if abs(drift) < d:
+                break
+            step = d if drift > 0 else -d
+            moved = False
+            for i in range(1, k - 1):
+                if abs(drift) < d:
+                    break
+                nv = final[i] + step
+                if final[i - 1] < nv < final[i + 1]:
+                    old_val = final[i]
+                    final[i] = nv
+                    if _ratios_ok(final, i):
+                        new_drift = drift - step * counts[i]
+                        if abs(new_drift) < abs(drift):
+                            drift = new_drift
+                            moved = True
+                        else:
+                            final[i] = old_val
+                    else:
+                        final[i] = old_val
+            if not moved:
+                break
+
+        return final
+
+    # ── Main build ───────────────────────────────────────────────────────
+
+    def build(self):
+        """Search for the optimal distribution and return results.
+
+        Returns:
+            tuple: (k, ideal_vals, final_vals, counts, meta)
+              - k (int)             : Number of tiers
+              - ideal_vals (list)   : Pre-fine-tune values
+              - final_vals (list)   : Pool-corrected values
+              - counts (list)       : Player count per tier
+              - meta (dict)         : Engine metadata (actual min/max/mult used)
+        """
+        d = self.DENOM
+
+        # Define search ranges with parameter relaxation
+        min_lo = round(self.min_val * 0.90 / d) * d
+        min_hi = round(self.min_val * 1.10 / d) * d
+        min_range = list(range(max(d, min_lo), min_hi + d, d))
+        if not min_range:
+            min_range = [round(self.min_val / d) * d]
+
+        max_lo = round(self.max_val * 0.80 / d) * d
+        max_hi = round(self.max_val * 1.20 / d) * d
+        max_step = max(d, round((max_hi - max_lo) / 10 / d) * d)
+        max_range = list(range(max(d, max_lo), max_hi + max_step, max_step))
+        if not max_range:
+            max_range = [round(self.max_val / d) * d]
+
+        # Adaptive drift tolerance: tighter pools get stricter limits
+        # avg_bounty / max_bounty ratio indicates how top-heavy the pool is
+        avg_bounty = self.pool / self.players
+        top_heaviness = self.max_val / avg_bounty
+        drift_tolerance = min(15.0, max(3.0, top_heaviness * 0.5))
+
+        best_score = float('inf')
+        best_result = None
+
+        for K in range(5, 11):
+            for top in self.TOP_PATTERNS:
+                for steep_x10 in range(13, 28, 2):
+                    steep = steep_x10 / 10.0
+                    counts = self._build_counts(K, top, steep)
+                    if counts is None:
+                        continue
+
+                    for mn in min_range:
+                        for mx in max_range:
+                            if mx <= mn:
+                                continue
+
+                            for alpha_x10 in range(11, 35, 1):
+                                alpha = alpha_x10 / 10.0
+                                vals = self._power_curve_values(K, mn, mx, alpha)
+                                if vals is None:
+                                    continue
+
+                                # Quick checks before full scoring
+                                ratios = [vals[i + 1] / vals[i]
+                                          for i in range(K - 1)]
+
+                                # First ratio must be within ±20% of target
+                                if not (self.mult_start * 0.80 <= ratios[0]
+                                        <= self.mult_start * 1.20):
+                                    continue
+
+                                # Ratios should be roughly increasing
+                                n_dec = sum(
+                                    1 for i in range(len(ratios) - 1)
+                                    if ratios[i + 1] < ratios[i] - 0.02
+                                )
+                                if n_dec > 1:
+                                    continue
+
+                                score, drift, _, _ = self._score(
+                                    vals, counts, self.pool, self.mult_start)
+
+                                if drift > drift_tolerance:
+                                    continue
+
+                                if score < best_score:
+                                    best_score = score
+                                    best_result = {
+                                        'k': K,
+                                        'vals': vals[:],
+                                        'counts': counts[:],
+                                        'top': top,
+                                        'alpha': alpha,
+                                        'mn': mn,
+                                        'mx': mx,
+                                    }
+
+        if best_result is None:
+            # Fallback: use simple geometric with original params
+            self.warnings.append(
+                "Could not find optimal power-curve fit. "
+                "Using fallback geometric distribution."
+            )
+            return self._fallback_build()
+
+        k = best_result['k']
+        ideal = best_result['vals']
+        counts = best_result['counts']
+
+        # Fine-tune pool drift
+        final = self._fine_tune(ideal, counts)
+
+        meta = {
+            'actual_min': best_result['mn'],
+            'actual_max': best_result['mx'],
+            'alpha': best_result['alpha'],
+            'top_pattern': best_result['top'],
+            'score': best_score,
+        }
+
+        return k, ideal, final, counts, meta
+
+    def _fallback_build(self):
+        """Pool-aware geometric fallback if power-curve search fails.
+
+        Iteratively adjusts max bounty downward (and min up if needed)
+        until pool drift < 5%. Reports adjusted params as warnings.
+        """
+        d = self.DENOM
+        best_fb = None
+        avg = self.pool / self.players
+
+        # Try scaling max down and min up
+        # For small pools, min may need to rise significantly
+        mn_mults = [1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0]
+        for k in range(7, 4, -1):
+            for mn_mult in mn_mults:
+                mn = round(self.min_val * mn_mult / d) * d or d
+                if mn >= avg:
+                    continue
+                for mx_mult in [x / 100.0 for x in range(100, 9, -5)]:
+                    mx = round(self.max_val * mx_mult / d) * d
+                    if mx <= mn * 3 or mx <= avg:
+                        continue
+
+                    ratio = (mx / mn) ** (1.0 / (k - 1))
+                    vals = [mn]
+                    for i in range(1, k):
+                        vals.append(round(vals[-1] * ratio / d) * d)
+                    vals[0] = mn
+                    vals[-1] = mx
+                    for i in range(1, k):
+                        if vals[i] <= vals[i - 1]:
+                            vals[i] = vals[i - 1] + d
+
+                    for tp in self.TOP_PATTERNS[:6]:
+                        if len(tp) > k:
+                            continue
+                        for steep in [1.3, 1.5, 2.0, 2.5]:
+                            counts = self._build_counts(k, tp, steep)
+                            if counts is None:
+                                continue
+
+                            total = sum(v * c for v, c in zip(vals, counts))
+                            drift = abs(total - self.pool) / self.pool * 100
+
+                            if best_fb is None or drift < best_fb[0]:
+                                best_fb = (drift, k, vals[:], counts[:],
+                                           mn, mx, tp)
+
+        if best_fb and best_fb[0] < 20:
+            _, k, vals, counts, mn, mx, tp = best_fb
+            final = self._fine_tune(vals, counts)
+            if mn != self.min_val or mx != self.max_val:
+                self.warnings.append(
+                    f"Inputs adjusted for feasibility: "
+                    f"min ${self.min_val}→${mn}, "
+                    f"max ${self.max_val:,}→${mx:,}"
+                )
+            meta = {
+                'actual_min': mn,
+                'actual_max': mx,
+                'alpha': 1.0,
+                'top_pattern': tp,
+                'score': -1,
+            }
+            return k, vals, final, counts, meta
+
+        # Last resort: scale everything from pool/players average
+        k = 6
+        mn = round(avg * 0.15 / d) * d or d
+        mx = round(avg * 8 / d) * d
+        ratio = (mx / mn) ** (1.0 / (k - 1))
+        vals = [mn]
+        for i in range(1, k):
+            vals.append(round(vals[-1] * ratio / d) * d)
+        vals[0] = mn
+        vals[-1] = mx
+        for i in range(1, k):
+            if vals[i] <= vals[i - 1]:
+                vals[i] = vals[i - 1] + d
+
         counts = [0] * k
         counts[-1] = 1
         counts[-2] = 2
-        remaining = self.players - 3
-        if remaining <= 0:
-            return counts
-        raw = [(w / total_w) * remaining for w in weights]
-        counts[:k - 2] = [max(1, math.floor(v)) for v in raw]
-        rem = remaining - sum(counts[:k - 2])
-        fractions = [v - math.floor(v) for v in raw]
-        for i in sorted(range(k - 2), key=lambda x: fractions[x], reverse=True)[:rem]:
-            counts[i] += 1
-        # Strict Pyramid Enforcement
-        for _ in range(k * 20):
-            changed = False
-            for i in range(k - 1):
-                if counts[i] < counts[i + 1]:
-                    if counts[i + 1] > 1:
-                        counts[i] += 1
-                        counts[i + 1] -= 1
-                        changed = True
-            if not changed:
-                break
-        return counts
+        counts[-3] = max(3, min(5, self.players // 20))
+        for i in range(k - 4, -1, -1):
+            counts[i] = max(counts[i + 1] + 1,
+                            round(counts[i + 1] * 1.5))
+        diff = self.players - sum(counts)
+        counts[0] += diff
+        if counts[0] <= counts[1]:
+            counts[0] = counts[1] + 1
 
-    def _generate_ideal_values(self, k):
-        """Generate bounty values with dynamic strength curve.
-        Uses a power-curve (t^p) to interpolate multipliers between
-        mult_start and mult_end across K-1 steps. Pins both endpoints,
-        enforces monotonicity, scales to exact min/max span, then
-        compounds into final USDT values.
-
-        Strength interpretation:
-          p > 1.0 → flat start, sharp top (late spike)
-          p < 1.0 → sharp start, flat top (early spike)
-          p = 1.0 → linear
-
-        Args:
-            k (int): Number of tiers
-        Returns:
-            list[float]: Bounty values per tier (ascending, snapped to denomination)
-        """
-        steps = k - 1
-        ratios = [0.0] * steps
-        is_descending = (self.mult_start > self.mult_end)
-        r_bound_start = self.mult_start
-        r_bound_end = self.mult_end
-
-        # 1. PIN ENDPOINTS
-        ratios[0] = r_bound_start
-        ratios[-1] = r_bound_end
-
-        # 2. GENERATE DYNAMIC STRENGTH CURVE
-        p = self.strength
-        range_diff = r_bound_end - r_bound_start
-        for i in range(1, steps - 1):
-            t = i / (steps - 1)
-            curve_val = range_diff * (t ** p)
-            ratios[i] = r_bound_start + curve_val
-
-        # 3. ENFORCE BOUNDS & MONOTONICITY
-        safe_min = min(r_bound_start, r_bound_end)
-        safe_max = max(r_bound_start, r_bound_end)
-        ratios = [max(safe_min, min(safe_max, r)) for r in ratios]
-        if is_descending:
-            for i in range(steps - 1, 0, -1):
-                if ratios[i] > ratios[i - 1]:
-                    ratios[i] = ratios[i - 1]
-        else:
-            for i in range(1, steps):
-                if ratios[i] < ratios[i - 1]:
-                    ratios[i] = ratios[i - 1]
-
-        # 4. SCALE TO EXACT SPAN
-        target_prod = self.max_val / self.min_val
-        current_prod = math.prod(ratios)
-        if current_prod > 0:
-            scale_factor = (target_prod / current_prod) ** (1.0 / steps)
-            ratios = [max(safe_min, min(safe_max, r * scale_factor)) for r in ratios]
-
-        # 5. RE-VALIDATE AFTER SCALING
-        ratios = [max(safe_min, min(safe_max, r)) for r in ratios]
-        if is_descending:
-            for i in range(steps - 1, 0, -1):
-                if ratios[i] > ratios[i - 1]:
-                    ratios[i] = ratios[i - 1]
-        else:
-            for i in range(1, steps):
-                if ratios[i] < ratios[i - 1]:
-                    ratios[i] = ratios[i - 1]
-
-        # 6. COMPOUND VALUES
-        vals = [self.min_val]
-        for r in ratios:
-            vals.append(vals[-1] * r)
-        vals = [round(v / self.denom) * self.denom for v in vals]
-        vals[0] = self.min_val
-        vals[-1] = self.max_val
-
-        # Explicit L2 Pin
-        vals[1] = round(self.min_val * self.mult_start / self.denom) * self.denom
-
-        # Strictly increasing bounties
-        for i in range(1, k):
-            if vals[i] <= vals[i - 1]:
-                vals[i] = vals[i - 1] + self.denom
-        return vals
-
-    def build(self, k=None):
-        """Main entry point — build the complete bounty distribution.
-        Orchestrates the full pipeline: K recommendation → player allocation →
-        ideal value generation → drift correction.
-
-        Drift correction: adjusts middle tiers by denomination steps to bring
-        the total pool sum as close to the target as possible. Unlike v6's
-        _reconcile_pool, this is a lighter single-pass correction — the
-        ideal values serve as the display reference, and final values are
-        the pool-corrected output.
-
-        Args:
-            k (int, optional): Override number of tiers. If None, auto-recommends.
-        Returns:
-            tuple: (k, ideal, final, counts)
-              - k (int)           : Number of tiers used
-              - ideal (list[float]): Ideal bounty values (pre-correction)
-              - final (list[float]): Pool-corrected bounty values
-              - counts (list[int]) : Player count per tier (index 0 = lowest)
-        Raises:
-            ValueError: If pool cannot be distributed within constraints
-        """
-        if k is None:
-            k = self.recommend_k()
-        counts = self._allocate_players(k)
-        ideal = self._generate_ideal_values(k)
-        drift = self.pool - sum(v * c for v, c in zip(ideal, counts))
-        final = list(ideal)
-        if abs(drift) > 0.5:
-            step = self.denom if drift > 0 else -self.denom
-            for i in range(2, k - 2):
-                if abs(drift) < self.denom / 2:
-                    break
-                nv = final[i] + step
-                if self.min_val < nv < self.max_val:
-                    final[i] = nv
-                    drift -= step * counts[i]
-        return k, ideal, final, counts
+        self.warnings.append(
+            f"Original min/max infeasible for this pool. "
+            f"Auto-adjusted to min=${mn}, max=${mx:,}"
+        )
+        final = self._fine_tune(vals, counts)
+        meta = {
+            'actual_min': mn,
+            'actual_max': mx,
+            'alpha': 1.0,
+            'top_pattern': [1, 2, counts[-3]],
+            'score': -1,
+        }
+        return k, vals, final, counts, meta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# METABASE CLIENT (lightweight, reusable)
+# SECTION 2: METABASE CLIENT
 # ─────────────────────────────────────────────────────────────────────────────
 
 METABASE_BASE_URL = "https://baazigames.metabaseapp.com"
 METABASE_DATABASE_ID = 133
 
+
 def get_metabase_session():
-    """Get or create Metabase session headers."""
+    """Get Metabase session headers using API key."""
     import requests
     api_key = st.session_state.get("metabase_api_key", "")
     if not api_key:
@@ -349,26 +485,13 @@ def get_metabase_session():
 
 
 def query_metabase(sql: str) -> pd.DataFrame:
-    """Execute a SQL query against CoinPoker's cp_prod database via Metabase API.
-
-    TO CHANGE THE DATABASE:
-      - Change DB_ID below (133 = cp_prod on Athena)
-      - Change METABASE_URL if using a different Metabase instance
-
-    TO ADD NEW QUERIES:
-      - Add a new SQL template string (like BOUNTY_TOURNAMENT_QUERY)
-      - Call this function with the formatted SQL
-
-    Args:
-        sql (str): Raw SQL query string (Athena/Presto dialect)
-    Returns:
-        pd.DataFrame: Query results as a DataFrame (empty if error/no results)
-    """
+    """Execute a SQL query against CoinPoker's cp_prod database via Metabase API."""
     import requests
     headers = get_metabase_session()
     if headers is None:
         st.error("Metabase API key required. Enter it in the sidebar.")
         return pd.DataFrame()
+
     payload = {
         "database": METABASE_DATABASE_ID,
         "type": "native",
@@ -377,9 +500,7 @@ def query_metabase(sql: str) -> pd.DataFrame:
     try:
         resp = requests.post(
             f"{METABASE_BASE_URL}/api/dataset",
-            json=payload,
-            headers=headers,
-            timeout=120,
+            json=payload, headers=headers, timeout=120,
         )
         resp.raise_for_status()
         result = resp.json()
@@ -394,16 +515,10 @@ def query_metabase(sql: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# --- SQL: Fetch bounty tournaments only (PKO, CoinHunter, etc.) ---
-# Filter: bounty_amount > 0 ensures only tournaments with knockout bounties
-# lobby_id != 9 excludes freerolls
-# TO MODIFY: change the WHERE clause, add columns, or adjust the LIMIT
 BOUNTY_TOURNAMENT_QUERY = """
 SELECT
-    tournament_id,
-    tournament_name,
-    MIN(buy_in) AS buy_in,
-    MIN(entry_fee) AS entry_fee,
+    tournament_id, tournament_name,
+    MIN(buy_in) AS buy_in, MIN(entry_fee) AS entry_fee,
     MIN(bounty_amount) AS bounty_amount,
     COUNT(DISTINCT user_id) AS player_count,
     SUM(buy_in) AS total_buyin_pool,
@@ -412,8 +527,7 @@ SELECT
     MIN(lobby_id) AS lobby_id
 FROM lakehouse_gold.user_tournament_play_history
 WHERE tournament_date BETWEEN DATE('{start}') AND DATE('{end}')
-  AND lobby_id != 9
-  AND bounty_amount > 0
+  AND lobby_id != 9 AND bounty_amount > 0
 GROUP BY tournament_id, tournament_name
 HAVING COUNT(DISTINCT user_id) >= {min_players}
 ORDER BY MIN(bounty_amount) DESC, total_buyin_pool DESC
@@ -422,18 +536,15 @@ LIMIT 50
 
 ALL_TOURNAMENT_QUERY = """
 SELECT
-    tournament_id,
-    tournament_name,
-    MIN(buy_in) AS buy_in,
-    MIN(entry_fee) AS entry_fee,
+    tournament_id, tournament_name,
+    MIN(buy_in) AS buy_in, MIN(entry_fee) AS entry_fee,
     MIN(bounty_amount) AS bounty_amount,
     COUNT(DISTINCT user_id) AS player_count,
     SUM(buy_in) AS total_buyin_pool,
     MIN(tournament_date) AS tournament_date
 FROM lakehouse_gold.user_tournament_play_history
 WHERE tournament_date BETWEEN DATE('{start}') AND DATE('{end}')
-  AND lobby_id != 9
-  AND (buy_in + entry_fee) > 0
+  AND lobby_id != 9 AND (buy_in + entry_fee) > 0
 GROUP BY tournament_id, tournament_name
 HAVING COUNT(DISTINCT user_id) >= {min_players}
 ORDER BY total_buyin_pool DESC
@@ -442,7 +553,7 @@ LIMIT 50
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STREAMLIT APP
+# SECTION 3: STREAMLIT APP
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -452,113 +563,39 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS
 st.markdown("""
 <style>
     .stMetric > div { background: #1a1a2e; border-radius: 10px; padding: 12px 16px; }
     .stMetric label { color: #8892b0 !important; font-size: 0.85rem !important; }
     .stMetric [data-testid="stMetricValue"] { color: #64ffda !important; }
     div[data-testid="stSidebar"] { background: #0d1117; }
-    .compare-badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
-        font-size: 0.75rem; font-weight: 600; margin-left: 6px; }
-    .compare-a { background: #1f6feb33; color: #58a6ff; }
-    .compare-b { background: #f0883e33; color: #f0883e; }
-    /* Red Run Simulation button */
     button[kind="primary"], .stButton > button[kind="primary"],
     div.stButton > button[type="button"][kind="primary"] {
         background-color: #e63946 !important;
-        border-color: #e63946 !important;
-        color: white !important;
+        border-color: #e63946 !important; color: white !important;
     }
     button[kind="primary"]:hover, .stButton > button[kind="primary"]:hover {
-        background-color: #c1121f !important;
-        border-color: #c1121f !important;
+        background-color: #c1121f !important; border-color: #c1121f !important;
     }
     .engine-badge {
         display: inline-block;
         background: linear-gradient(135deg, #1f6feb22, #64ffda22);
-        border: 1px solid #64ffda44;
-        border-radius: 6px;
-        padding: 2px 10px;
-        font-size: 0.75rem;
-        color: #64ffda;
-        font-weight: 600;
-        margin-left: 8px;
+        border: 1px solid #64ffda44; border-radius: 6px;
+        padding: 2px 10px; font-size: 0.75rem;
+        color: #64ffda; font-weight: 600; margin-left: 8px;
     }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🎯 Mystery Bounty Simulator")
-st.caption("CoinPoker Internal — Simulate & fine-tune bounty prize distributions · Engine v15")
+st.caption("CoinPoker Internal — Power-Curve Engine v18")
 
-# ─── SIDEBAR: Engine Parameters ───
+
+# ─── SIDEBAR ───
 with st.sidebar:
-    st.header("⚙️ Engine Parameters")
-    st.caption("BountyArchitect v15 — Dynamic Strength Control")
+    st.header("🔗 Metabase Connection")
+    st.caption("Connect to cp_prod for live tournament data")
 
-    st.subheader("Distribution Mode")
-    mode = st.selectbox(
-        "Curve shape",
-        ["power_decay", "linear_decay", "gaussian_mid"],
-        help="power_decay = pyramid (most common), linear_decay = staircase, gaussian_mid = bell curve",
-    )
-    strength = st.slider(
-        "Curve strength",
-        min_value=0.1, max_value=5.0, value=1.5, step=0.1,
-        help=(
-            "Controls the shape of the multiplier curve:\n"
-            "• > 1.0 = Late spike (flat near start, sharp jump at top)\n"
-            "• < 1.0 = Early spike (sharp jump at start, flat at top)\n"
-            "• = 1.0 = Linear interpolation"
-        ),
-    )
-
-    # Strength visual hint
-    if strength > 1.2:
-        st.caption(f"📈 **Late spike** — multipliers accelerate toward top tiers")
-    elif strength < 0.8:
-        st.caption(f"📉 **Early spike** — multipliers jump fast, then flatten")
-    else:
-        st.caption(f"↔️ **Linear** — smooth multiplier progression")
-
-    st.subheader("Multiplier Range")
-    mult_start = st.slider(
-        "Start multiplier (tier-to-tier at bottom)",
-        min_value=1.1, max_value=5.0, value=2.0, step=0.1,
-        help="Ratio between consecutive tiers at the low end (L1→L2)",
-    )
-    mult_end = st.slider(
-        "End multiplier (tier-to-tier at top)",
-        min_value=1.1, max_value=5.0, value=3.0, step=0.1,
-        help="Ratio between consecutive tiers at the high end (top tiers)",
-    )
-    st.caption(
-        f"Multipliers interpolate {mult_start:.1f}x → {mult_end:.1f}x "
-        f"({'increasing' if mult_end > mult_start else 'decreasing' if mult_end < mult_start else 'flat'}) "
-        f"via strength curve"
-    )
-
-    st.subheader("Tier Settings")
-    use_auto_k = st.checkbox("Auto-recommend K", value=True)
-    manual_k = st.slider(
-        "Manual K (number of tiers)",
-        min_value=5, max_value=12, value=7,
-        disabled=use_auto_k,
-    )
-    max_top = st.slider(
-        "Max players in top 3 tiers",
-        min_value=3, max_value=20, value=8,
-        help="Scarcity cap: top 3 tiers combined (top tier is always 1, second is always 2)",
-    )
-    denomination = st.number_input(
-        "Denomination (USDT)",
-        min_value=1, max_value=100, value=5,
-        help="Values snap to this grid (e.g. $5, $10, $15...)",
-    )
-
-    st.divider()
-    st.subheader("🔗 Metabase Connection")
-    # Load API key from Streamlit secrets (for cloud deployment) or manual entry
     secrets_key = ""
     try:
         secrets_key = st.secrets.get("METABASE_API_KEY", "")
@@ -566,87 +603,100 @@ with st.sidebar:
         pass
     if secrets_key and "metabase_api_key" not in st.session_state:
         st.session_state["metabase_api_key"] = secrets_key
+
     api_key = st.text_input(
-        "API Key",
-        type="password",
+        "API Key", type="password",
         value=st.session_state.get("metabase_api_key", ""),
-        help="Metabase API key for cp_prod access. Auto-loaded from secrets on Streamlit Cloud.",
+        help="Metabase API key for cp_prod access.",
     )
     if api_key:
         st.session_state["metabase_api_key"] = api_key
         st.success("Connected to cp_prod", icon="✅")
     else:
-        st.warning("Enter API key or configure it in Streamlit Cloud secrets.")
+        st.warning("Enter API key for Metabase access.")
 
-# ─── Initialize session state ───
+    st.divider()
+    st.header("ℹ️ Engine Info")
+    st.caption(
+        "**BountyArchitect v18** — Power-Curve\n\n"
+        "The engine automatically determines:\n"
+        "- Number of tiers (K)\n"
+        "- End multiplier\n"
+        "- Top-tier count pattern\n"
+        "- Count curve steepness\n\n"
+        "Parameter relaxation:\n"
+        "- Min bounty: ±10%\n"
+        "- Max bounty: ±20%\n"
+        "- Start multiplier: ±10%"
+    )
+
+
+# ─── Session state ───
 if "comparison_runs" not in st.session_state:
     st.session_state.comparison_runs = []
 
 
-def run_simulation(pool, players, min_bounty, max_bounty, label=""):
-    """Run the BountyArchitect v15 engine and return results dict.
-    Returns a dict with both 'ideal' (pre-correction) and 'vals' (pool-corrected)
-    tier values, plus counts, metrics, and engine params.
-    """
+# ─── Simulation runner ───
+
+def run_simulation(pool, players, min_bounty, max_bounty,
+                   mult_start, label=""):
+    """Run BountyArchitect v18 and return results dict."""
     try:
         engine = BountyArchitect(
-            pool=pool,
-            players=players,
-            min_bounty=min_bounty,
-            max_bounty=max_bounty,
+            pool=pool, players=players,
+            min_bounty=min_bounty, max_bounty=max_bounty,
             mult_start=mult_start,
-            mult_end=mult_end,
-            mode=mode,
-            strength=strength,
-            max_top_tier_count=max_top,
-            denomination=denomination,
         )
-        k_val = None if use_auto_k else manual_k
-        k, ideal, final, counts = engine.build(k=k_val)
+        k, ideal, final, counts, meta = engine.build()
 
-        # Use final (pool-corrected) values for the distribution table
         tiers = []
         for i in range(k):
+            ratio_val = final[i] / final[i - 1] if i > 0 else None
+            ratio_cnt = counts[i - 1] / counts[i] if i > 0 else None
             tiers.append({
-                "Tier": f"L{i+1}",
-                "Ideal Bounty (USDT)": ideal[i],
-                "Final Bounty (USDT)": final[i],
+                "Tier": f"L{i + 1}",
                 "Players": counts[i],
-                "Subtotal": round(final[i] * counts[i], 2),
-                "% of Pool": round(final[i] * counts[i] / pool * 100, 1),
-                "% of Players": round(counts[i] / players * 100, 1),
+                "Count Ratio": f"{ratio_cnt:.1f}x" if ratio_cnt else "—",
+                "Bounty (USDT)": final[i],
+                "Bounty Ratio": f"{ratio_val:.2f}x" if ratio_val else "—",
+                "Pool $": round(final[i] * counts[i], 2),
+                "Pool %": round(final[i] * counts[i] / pool * 100, 1),
             })
 
-        # Pool accuracy check
         pool_total = sum(v * c for v, c in zip(final, counts))
-        pool_error = abs(pool_total - pool)
 
-        result = {
+        return {
             "label": label,
             "k": k,
             "ideal": ideal,
-            "vals": final,       # pool-corrected — used for charts
+            "vals": final,
             "counts": counts,
             "tiers": tiers,
             "pool": pool,
             "pool_total": round(pool_total, 2),
-            "pool_error": round(pool_error, 2),
+            "pool_error": round(abs(pool_total - pool), 2),
+            "pool_drift_pct": round(abs(pool_total - pool) / pool * 100, 2),
             "players": players,
             "min_bounty": min_bounty,
             "max_bounty": max_bounty,
+            "mult_start": mult_start,
             "warnings": engine.warnings,
+            "meta": meta,
             "params": {
-                "mode": mode, "strength": strength,
-                "mult_start": mult_start, "mult_end": mult_end,
-                "denomination": denomination, "max_top": max_top,
+                "mult_start": mult_start,
+                "actual_min": meta['actual_min'],
+                "actual_max": meta['actual_max'],
+                "alpha": meta['alpha'],
+                "top_pattern": str(meta['top_pattern']),
+                "k": k,
             },
         }
-        return result
-
     except Exception as e:
         st.error(f"Engine error: {e}")
         return None
 
+
+# ─── Results renderer ───
 
 def render_results(result):
     """Render simulation results with charts and metrics."""
@@ -660,155 +710,128 @@ def render_results(result):
     pool = result["pool"]
     players = result["players"]
     k = result["k"]
-    pool_error = result.get("pool_error", 0)
+    meta = result.get("meta", {})
 
     # ── Key Metrics ──
     avg_bounty = pool / players
-    median_idx = 0
-    cumulative = 0
-    for i, c in enumerate(counts):
-        cumulative += c
-        if cumulative >= players / 2:
-            median_idx = i
-            break
-    median_bounty = vals[median_idx]
+    ratios = [vals[i + 1] / vals[i] for i in range(k - 1)]
     max_ratio = vals[-1] / vals[0]
-    top3_pct = sum(counts[-3:]) / players * 100 if k >= 3 else 0
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Tiers (K)", k)
-    col2.metric("Avg Bounty", f"${avg_bounty:,.2f}")
-    col3.metric("Median Bounty", f"${median_bounty:,.2f}")
-    col4.metric("Max/Min Ratio", f"{max_ratio:,.1f}x")
-    col5.metric("Top 3 Tiers", f"{sum(counts[-3:])} players ({top3_pct:.0f}%)")
+    col2.metric("Avg Bounty", f"${avg_bounty:,.0f}")
+    col3.metric("Start Mult", f"{ratios[0]:.2f}x")
+    col4.metric("End Mult", f"{ratios[-1]:.2f}x")
+    col5.metric("Pool Drift", f"{result['pool_drift_pct']:.2f}%")
 
-    # Pool accuracy info
-    if pool_error > 0.01:
+    # Engine metadata
+    st.caption(
+        f"**Engine:** α={meta.get('alpha', '?')} · "
+        f"Top pattern={meta.get('top_pattern', '?')} · "
+        f"Actual min=${meta.get('actual_min', '?')} · "
+        f"Actual max=${meta.get('actual_max', '?'):,}"
+    )
+
+    if result.get("pool_error", 0) > 1:
         st.info(
-            f"ℹ️ **Pool drift:** ${pool_error:.2f} USDT — Final pool total is "
-            f"${result['pool_total']:,.2f} vs target ${pool:,.2f}. "
-            f"Middle tiers were adjusted by denomination steps to correct. "
-            f"Ideal values (pre-correction) are shown in the table."
+            f"ℹ️ Pool drift: ${result['pool_error']:.0f} USDT — "
+            f"total ${result['pool_total']:,.0f} vs target ${pool:,.0f}"
         )
 
     # ── Charts ──
     chart_col1, chart_col2 = st.columns(2)
 
     with chart_col1:
-        # Bounty value bar chart — show both ideal and final if they differ
-        fig_vals = go.Figure()
         colors = px.colors.sequential.Teal
         n_colors = len(colors)
-        tier_colors = [colors[min(i * n_colors // k, n_colors - 1)] for i in range(k)]
-        tier_labels = [f"L{i+1}" for i in range(k)]
+        tier_colors = [colors[min(i * n_colors // k, n_colors - 1)]
+                       for i in range(k)]
+        tier_labels = [f"L{i + 1}" for i in range(k)]
 
+        fig_vals = go.Figure()
         fig_vals.add_trace(go.Bar(
-            name="Final (pool-corrected)",
-            x=tier_labels,
-            y=vals,
+            name="Bounty Value",
+            x=tier_labels, y=vals,
             marker_color=tier_colors,
-            text=[f"${v:,.2f}" for v in vals],
+            text=[f"${v:,.0f}" for v in vals],
             textposition="outside",
-            hovertemplate="<b>%{x}</b><br>Final: $%{y:,.2f}<extra></extra>",
+            hovertemplate="<b>%{x}</b><br>$%{y:,.0f}<extra></extra>",
         ))
-
-        # Overlay ideal as a line if it differs meaningfully from final
-        if any(abs(a - b) > 0.01 for a, b in zip(ideal, vals)):
-            fig_vals.add_trace(go.Scatter(
-                name="Ideal (pre-correction)",
-                x=tier_labels,
-                y=ideal,
-                mode="lines+markers",
-                line=dict(color="#f0883e", width=2, dash="dot"),
-                marker=dict(size=6, color="#f0883e"),
-                hovertemplate="<b>%{x}</b><br>Ideal: $%{y:,.2f}<extra></extra>",
-            ))
-
         fig_vals.update_layout(
             title="Bounty Values by Tier",
-            xaxis_title="Tier",
-            yaxis_title="Bounty Value (USDT)",
-            template="plotly_dark",
-            height=400,
+            xaxis_title="Tier", yaxis_title="Bounty (USDT)",
+            template="plotly_dark", height=400,
             margin=dict(t=60, b=40),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         st.plotly_chart(fig_vals, use_container_width=True)
 
     with chart_col2:
-        # Player distribution (pyramid-style horizontal bar)
         fig_players = go.Figure()
         fig_players.add_trace(go.Bar(
-            y=[f"L{i+1} (${vals[i]:,.0f})" for i in range(k)],
-            x=counts,
-            orientation="h",
+            y=[f"L{i + 1} (${vals[i]:,.0f})" for i in range(k)],
+            x=counts, orientation="h",
             marker_color=tier_colors,
-            text=[f"{c} ({c/players*100:.0f}%)" for c in counts],
+            text=[f"{c} ({c / players * 100:.0f}%)" for c in counts],
             textposition="outside",
             hovertemplate="<b>%{y}</b><br>Players: %{x}<extra></extra>",
         ))
         fig_players.update_layout(
-            title="Player Allocation (Pyramid)",
-            xaxis_title="Number of Players",
-            yaxis_title="Tier",
-            template="plotly_dark",
-            height=400,
+            title="Player Distribution",
+            xaxis_title="Players", yaxis_title="Tier",
+            template="plotly_dark", height=400,
             margin=dict(t=60, b=40),
         )
         st.plotly_chart(fig_players, use_container_width=True)
 
-    # ── Multiplier progression chart ──
+    # ── Multiplier progression ──
     if k >= 3:
-        multipliers = [vals[i] / vals[i - 1] for i in range(1, k)]
-        ideal_multipliers = [ideal[i] / ideal[i - 1] for i in range(1, k)]
-
         fig_mult = go.Figure()
         fig_mult.add_trace(go.Scatter(
-            x=[f"L{i}→L{i+1}" for i in range(1, k)],
-            y=multipliers,
+            x=[f"L{i}→L{i + 1}" for i in range(1, k)],
+            y=ratios,
             mode="lines+markers",
-            name="Final multipliers",
+            name="Value ratios",
             line=dict(color="#64ffda", width=2),
             marker=dict(size=8),
-            hovertemplate="<b>%{x}</b><br>Multiplier: %{y:.3f}x<extra></extra>",
+            hovertemplate="<b>%{x}</b><br>%{y:.2f}x<extra></extra>",
         ))
+
+        # Count ratios
+        cnt_ratios = [counts[i] / counts[i + 1] for i in range(k - 1)]
         fig_mult.add_trace(go.Scatter(
-            x=[f"L{i}→L{i+1}" for i in range(1, k)],
-            y=ideal_multipliers,
+            x=[f"L{i}→L{i + 1}" for i in range(1, k)],
+            y=cnt_ratios,
             mode="lines+markers",
-            name="Ideal multipliers",
+            name="Count ratios",
             line=dict(color="#f0883e", width=2, dash="dot"),
             marker=dict(size=6),
-            hovertemplate="<b>%{x}</b><br>Ideal mult: %{y:.3f}x<extra></extra>",
+            hovertemplate="<b>%{x}</b><br>%{y:.1f}x<extra></extra>",
         ))
-        fig_mult.add_hline(y=mult_start, line_dash="dash", line_color="#8892b0",
-                           annotation_text=f"mult_start={mult_start:.1f}x", annotation_position="left")
-        fig_mult.add_hline(y=mult_end, line_dash="dash", line_color="#8892b0",
-                           annotation_text=f"mult_end={mult_end:.1f}x", annotation_position="left")
+
         fig_mult.update_layout(
-            title=f"Tier-to-Tier Multiplier Progression (strength={strength:.1f})",
+            title="Ratio Progression (Value & Count)",
             xaxis_title="Tier Transition",
-            yaxis_title="Multiplier",
-            template="plotly_dark",
-            height=300,
+            yaxis_title="Ratio",
+            template="plotly_dark", height=300,
             margin=dict(t=60, b=40),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1),
         )
         st.plotly_chart(fig_mult, use_container_width=True)
 
     # ── Pool distribution pie ──
     subtotals = [round(v * c, 2) for v, c in zip(vals, counts)]
     fig_pie = go.Figure(data=[go.Pie(
-        labels=[f"L{i+1}" for i in range(k)],
-        values=subtotals,
-        hole=0.4,
+        labels=[f"L{i + 1}" for i in range(k)],
+        values=subtotals, hole=0.4,
         marker=dict(colors=tier_colors),
         textinfo="label+percent",
-        hovertemplate="<b>%{label}</b><br>$%{value:,.2f} (%{percent})<extra></extra>",
+        hovertemplate="<b>%{label}</b><br>$%{value:,.0f} (%{percent})"
+                      "<extra></extra>",
     )])
     fig_pie.update_layout(
         title="Pool Distribution by Tier",
-        template="plotly_dark",
-        height=350,
+        template="plotly_dark", height=350,
         margin=dict(t=60, b=20),
     )
     st.plotly_chart(fig_pie, use_container_width=True)
@@ -817,616 +840,342 @@ def render_results(result):
     st.subheader("Distribution Table")
     st.dataframe(
         df.style.format({
-            "Ideal Bounty (USDT)": "${:,.2f}",
-            "Final Bounty (USDT)": "${:,.2f}",
-            "Subtotal": "${:,.2f}",
-            "% of Pool": "{:.1f}%",
-            "% of Players": "{:.1f}%",
+            "Bounty (USDT)": "${:,.0f}",
+            "Pool $": "${:,.0f}",
+            "Pool %": "{:.1f}%",
         }),
         use_container_width=True,
         hide_index=True,
     )
-
+    pool_err = result['pool_error']
+    pool_tot = result['pool_total']
+    drift_str = f"(drift: ${pool_err:.0f})" if pool_err >= 1 else "(✅ exact)"
     st.caption(
-        f"**Total: {players} players, ${pool:,.2f} USDT target pool, "
-        f"${result['pool_total']:,.2f} actual pool** "
-        f"{'(exact match ✅)' if pool_error < 0.01 else f'(drift: ${pool_error:.2f})'}"
+        f"**Total: {players} players · ${pool:,.0f} target · "
+        f"${pool_tot:,.0f} actual** {drift_str}"
     )
 
-    # Warnings
-    if result["warnings"]:
+    if result.get("warnings"):
         for w in result["warnings"]:
             st.warning(w)
 
     return df
 
 
-# ─── TABS ───
-tab_manual, tab_metabase, tab_compare, tab_editor = st.tabs([
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+tab_manual, tab_metabase, tab_compare = st.tabs([
     "📝 Manual Simulator",
     "🔌 Load from CoinPoker",
     "🔄 Compare Runs",
-    "✏️ Code Editor",
 ])
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1: Manual Simulator
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── TAB 1: Manual Simulator ─────────────────────────────────────────────────
+
 with tab_manual:
     st.subheader("Enter Tournament Parameters")
 
     mcol1, mcol2 = st.columns(2)
     with mcol1:
-        pool = st.number_input("Prize Pool (USDT)", min_value=100, max_value=1_000_000, value=20000, step=1000)
-        min_bounty = st.number_input("Min Bounty (USDT)", min_value=1.0, max_value=10000.0, value=10.0, step=1.0)
+        pool = st.number_input(
+            "Prize Pool (USDT)",
+            min_value=100, max_value=1_000_000, value=100000, step=1000)
+        min_bounty = st.number_input(
+            "Min Bounty (USDT)",
+            min_value=1.0, max_value=10000.0, value=100.0, step=10.0)
+        mult_start = st.number_input(
+            "Start Multiplier",
+            min_value=1.2, max_value=5.0, value=2.0, step=0.1,
+            help="Target tier-to-tier ratio at L1→L2. Engine may flex ±10%.")
     with mcol2:
-        players = st.number_input("Players", min_value=5, max_value=10000, value=180, step=10)
-        max_bounty = st.number_input("Max Bounty (USDT)", min_value=10.0, max_value=100000.0, value=2000.0, step=100.0)
+        players = st.number_input(
+            "Players",
+            min_value=5, max_value=10000, value=100, step=10)
+        max_bounty = st.number_input(
+            "Max Bounty (USDT)",
+            min_value=10.0, max_value=500000.0, value=17000.0, step=500.0)
 
-    run_btn = st.button("🚀 Run Simulation", type="primary", use_container_width=True)
+    run_btn = st.button("🚀 Run Simulation", type="primary",
+                         use_container_width=True)
 
     if run_btn:
-        result = run_simulation(pool, players, min_bounty, max_bounty, label="Manual")
+        with st.spinner("Searching for optimal distribution..."):
+            result = run_simulation(
+                pool, players, min_bounty, max_bounty,
+                mult_start, label="Manual")
         if result:
             st.session_state["last_manual_result"] = result
             render_results(result)
 
-            # Export buttons
-            exp_col1, exp_col2, exp_col3 = st.columns(3)
+            exp1, exp2, exp3 = st.columns(3)
             df_export = pd.DataFrame(result["tiers"])
-            with exp_col1:
+            with exp1:
                 csv = df_export.to_csv(index=False)
-                st.download_button("📥 Download CSV", csv, "bounty_distribution.csv", "text/csv")
-            with exp_col2:
+                st.download_button("📥 CSV", csv,
+                                   "bounty_distribution.csv", "text/csv")
+            with exp2:
                 json_str = json.dumps({
-                    "k": result["k"],
-                    "ideal": result["ideal"],
-                    "vals": result["vals"],
+                    "k": result["k"], "vals": result["vals"],
                     "counts": result["counts"],
                     "pool": result["pool"],
                     "pool_total": result["pool_total"],
-                    "pool_error": result["pool_error"],
-                    "players": result["players"],
                     "params": result["params"],
-                    "warnings": result["warnings"],
                 }, indent=2)
-                st.download_button("📥 Download JSON", json_str, "bounty_config.json", "application/json")
-            with exp_col3:
+                st.download_button("📥 JSON", json_str,
+                                   "bounty_config.json", "application/json")
+            with exp3:
                 if st.button("📌 Save to Comparison"):
                     st.session_state.comparison_runs.append(result)
-                    st.success(f"Saved! ({len(st.session_state.comparison_runs)} runs stored)")
+                    st.success(
+                        f"Saved! ({len(st.session_state.comparison_runs)} runs)")
 
     elif "last_manual_result" in st.session_state:
         render_results(st.session_state["last_manual_result"])
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2: Load from CoinPoker (Metabase)
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── TAB 2: Load from CoinPoker ──────────────────────────────────────────────
+
 with tab_metabase:
     st.subheader("Load Real Tournament Data from cp_prod")
-    st.caption("Pull bounty tournaments from CoinPoker's data lake and simulate mystery bounty distributions")
 
     if not st.session_state.get("metabase_api_key"):
-        st.info("Enter your Metabase API key in the sidebar to connect to cp_prod.")
+        st.info("Enter your Metabase API key in the sidebar to connect.")
     else:
         lcol1, lcol2, lcol3, lcol4 = st.columns(4)
         with lcol1:
-            start_date = st.date_input("Start date", value=date.today() - timedelta(days=7))
+            start_date = st.date_input(
+                "Start date", value=date.today() - timedelta(days=7))
         with lcol2:
             end_date = st.date_input("End date", value=date.today())
         with lcol3:
-            min_player_filter = st.number_input("Min players", min_value=5, max_value=500, value=20)
+            min_player_filter = st.number_input(
+                "Min players", min_value=5, max_value=500, value=20)
         with lcol4:
-            bounty_only = st.checkbox("Bounty tournaments only", value=True,
-                                       help="Filter to tournaments with bounty_amount > 0 (PKO, CoinHunter, etc.)")
+            bounty_only = st.checkbox("Bounty only", value=True)
 
         if st.button("🔍 Fetch Tournaments", type="primary"):
-            with st.spinner("Querying cp_prod via Metabase..."):
-                query_template = BOUNTY_TOURNAMENT_QUERY if bounty_only else ALL_TOURNAMENT_QUERY
-                sql = query_template.format(
+            with st.spinner("Querying cp_prod..."):
+                tmpl = (BOUNTY_TOURNAMENT_QUERY if bounty_only
+                        else ALL_TOURNAMENT_QUERY)
+                sql = tmpl.format(
                     start=start_date.isoformat(),
                     end=end_date.isoformat(),
-                    min_players=min_player_filter,
-                )
-                df_tournaments = query_metabase(sql)
-
-            if not df_tournaments.empty:
-                st.session_state["tournaments_df"] = df_tournaments
+                    min_players=min_player_filter)
+                df_t = query_metabase(sql)
+            if not df_t.empty:
+                st.session_state["tournaments_df"] = df_t
                 st.session_state["tournaments_bounty_only"] = bounty_only
-                st.success(f"Found {len(df_tournaments)} {'bounty ' if bounty_only else ''}tournaments")
+                st.success(f"Found {len(df_t)} tournaments")
             else:
-                st.warning("No tournaments found for this date range. Try expanding the date range or lowering min players.")
+                st.warning("No tournaments found.")
 
-        if "tournaments_df" in st.session_state and not st.session_state["tournaments_df"].empty:
+        if ("tournaments_df" in st.session_state
+                and not st.session_state["tournaments_df"].empty):
             df_t = st.session_state["tournaments_df"]
-            is_bounty_data = st.session_state.get("tournaments_bounty_only", True)
 
-            # Show tournament picker
             def make_label(r):
                 name = r['tournament_name']
-                pcount = int(r['player_count'])
-                pool_val = float(r['total_buyin_pool'])
-                bounty = float(r.get('bounty_amount', 0))
-                if bounty > 0:
-                    return f"{name} — {pcount} players, ${pool_val:,.0f} pool, ${bounty:,.2f} bounty"
-                return f"{name} — {pcount} players, ${pool_val:,.0f} pool"
+                p = int(r['player_count'])
+                pool_v = float(r['total_buyin_pool'])
+                b = float(r.get('bounty_amount', 0))
+                if b > 0:
+                    return (f"{name} — {p} players, "
+                            f"${pool_v:,.0f} pool, ${b:,.2f} bounty")
+                return f"{name} — {p} players, ${pool_v:,.0f} pool"
 
             df_t["label"] = df_t.apply(make_label, axis=1)
-            selected_label = st.selectbox("Select a tournament", df_t["label"].tolist())
-            selected_row = df_t[df_t["label"] == selected_label].iloc[0]
+            selected_label = st.selectbox("Select tournament",
+                                          df_t["label"].tolist())
+            row = df_t[df_t["label"] == selected_label].iloc[0]
 
-            player_count = int(selected_row['player_count'])
-            buy_in_val = float(selected_row['buy_in'])
-            entry_fee_val = float(selected_row['entry_fee'])
-            total_buyin = float(selected_row['total_buyin_pool'])
-            bounty_amt = float(selected_row.get('bounty_amount', 0))
-            bounties_paid = float(selected_row.get('total_bounties_paid', 0)) if 'total_bounties_paid' in selected_row.index else 0
+            player_count = int(row['player_count'])
+            buy_in_val = float(row['buy_in'])
+            entry_fee_val = float(row['entry_fee'])
+            total_buyin = float(row['total_buyin_pool'])
+            bounty_amt = float(row.get('bounty_amount', 0))
             actual_bounty_pool = round(bounty_amt * player_count, 2)
 
-            # Tournament info card
             info_cols = st.columns(5)
             info_cols[0].metric("Players", f"{player_count}")
             info_cols[1].metric("Buy-in", f"${buy_in_val:,.2f}")
             info_cols[2].metric("Entry Fee", f"${entry_fee_val:,.2f}")
-            info_cols[3].metric("Starting Bounty", f"${bounty_amt:,.2f}")
+            info_cols[3].metric("Bounty", f"${bounty_amt:,.2f}")
             info_cols[4].metric("Bounty Pool", f"${actual_bounty_pool:,.2f}")
 
-            if bounties_paid > 0:
-                st.caption(f"**Actual bounties paid out:** ${bounties_paid:,.2f} USDT "
-                           f"(PKO progressive — grows as players are eliminated)")
-
             st.divider()
-            st.subheader("Mystery Bounty Simulation Parameters")
-            st.caption("Use the actual bounty pool from this tournament, or adjust to simulate a mystery bounty variant.")
+            st.subheader("Simulation Parameters")
 
             bcol1, bcol2, bcol3 = st.columns(3)
             with bcol1:
                 pool_mode = st.radio(
-                    "Bounty pool source",
-                    ["Use actual bounty pool", "Custom percentage", "Manual amount"],
-                    help="Choose how to calculate the mystery bounty pool",
+                    "Pool source",
+                    ["Actual bounty pool", "Custom %", "Manual"],
                 )
             with bcol2:
-                if pool_mode == "Use actual bounty pool":
+                if pool_mode == "Actual bounty pool":
                     sim_pool = actual_bounty_pool
-                    st.info(f"Pool: ${sim_pool:,.2f} (bounty × players)")
-                elif pool_mode == "Custom percentage":
-                    bounty_pct = st.slider(
-                        "% of total buy-in pool",
-                        min_value=10, max_value=90, value=50, step=5,
-                    )
-                    sim_pool = round(total_buyin * bounty_pct / 100, 2)
-                    st.info(f"Pool: ${sim_pool:,.2f} ({bounty_pct}% of ${total_buyin:,.2f})")
+                    st.info(f"Pool: ${sim_pool:,.2f}")
+                elif pool_mode == "Custom %":
+                    pct = st.slider("% of buy-in pool",
+                                    10, 90, 50, step=5)
+                    sim_pool = round(total_buyin * pct / 100, 2)
+                    st.info(f"Pool: ${sim_pool:,.2f} ({pct}%)")
                 else:
                     sim_pool = st.number_input(
-                        "Manual bounty pool (USDT)",
+                        "Manual pool (USDT)",
                         min_value=10.0, max_value=500000.0,
-                        value=float(actual_bounty_pool) if actual_bounty_pool > 0 else 1000.0,
-                        step=100.0,
-                    )
-
+                        value=max(100.0, float(actual_bounty_pool)),
+                        step=100.0)
             with bcol3:
                 mb_min = st.number_input(
-                    "Min bounty (USDT)", min_value=0.10, max_value=10000.0,
-                    value=max(0.50, round(bounty_amt * 0.1, 2)) if bounty_amt > 0 else 1.0,
-                    step=0.50,
-                    help="Lowest possible mystery bounty prize",
-                )
+                    "Min bounty (USDT)",
+                    min_value=0.10, max_value=10000.0,
+                    value=max(0.50, round(bounty_amt * 0.1, 2))
+                    if bounty_amt > 0 else 1.0,
+                    step=0.50)
                 mb_max = st.number_input(
-                    "Max bounty (USDT)", min_value=1.0, max_value=100000.0,
-                    value=max(5.0, round(sim_pool * 0.10, 0)) if sim_pool > 0 else 100.0,
-                    step=5.0,
-                    help="Jackpot mystery bounty prize",
-                )
+                    "Max bounty (USDT)",
+                    min_value=1.0, max_value=100000.0,
+                    value=max(5.0, round(sim_pool * 0.10, 0))
+                    if sim_pool > 0 else 100.0,
+                    step=5.0)
+                mb_mult = st.number_input(
+                    "Start multiplier",
+                    min_value=1.2, max_value=5.0, value=2.0, step=0.1)
 
-            st.metric("Simulation Pool", f"${sim_pool:,.2f} USDT",
-                       f"{player_count} players, ${sim_pool/player_count:,.2f} avg bounty")
-
-            if st.button("🎯 Simulate Mystery Bounty", type="primary", use_container_width=True):
-                result = run_simulation(
-                    pool=sim_pool,
-                    players=player_count,
-                    min_bounty=mb_min,
-                    max_bounty=mb_max,
-                    label=f"{selected_row['tournament_name']}",
-                )
+            if st.button("🎯 Simulate", type="primary",
+                          use_container_width=True):
+                with st.spinner("Searching for optimal distribution..."):
+                    result = run_simulation(
+                        sim_pool, player_count, mb_min, mb_max,
+                        mb_mult, label=row['tournament_name'])
                 if result:
                     st.session_state["last_metabase_result"] = result
                     render_results(result)
 
-                    exp_col1, exp_col2, exp_col3 = st.columns(3)
+                    exp1, exp2, exp3 = st.columns(3)
                     df_export = pd.DataFrame(result["tiers"])
-                    with exp_col1:
+                    with exp1:
                         csv = df_export.to_csv(index=False)
-                        st.download_button("📥 Download CSV", csv, "bounty_distribution.csv",
-                                           "text/csv", key="csv_mb")
-                    with exp_col2:
-                        json_str = json.dumps({
-                            "tournament_id": int(selected_row['tournament_id']),
-                            "tournament_name": selected_row['tournament_name'],
+                        st.download_button(
+                            "📥 CSV", csv,
+                            "bounty_distribution.csv", "text/csv",
+                            key="csv_mb")
+                    with exp2:
+                        j = json.dumps({
+                            "tournament_id": int(row['tournament_id']),
                             "k": result["k"],
-                            "ideal": result["ideal"],
                             "vals": result["vals"],
                             "counts": result["counts"],
                             "pool": result["pool"],
-                            "pool_total": result["pool_total"],
-                            "pool_error": result["pool_error"],
-                            "players": result["players"],
-                            "original_bounty_amount": bounty_amt,
                             "params": result["params"],
-                            "warnings": result["warnings"],
                         }, indent=2)
-                        st.download_button("📥 Download JSON", json_str, "bounty_config.json",
-                                           "application/json", key="json_mb")
-                    with exp_col3:
+                        st.download_button(
+                            "📥 JSON", j,
+                            "bounty_config.json", "application/json",
+                            key="json_mb")
+                    with exp3:
                         if st.button("📌 Save to Comparison", key="save_mb"):
                             st.session_state.comparison_runs.append(result)
-                            st.success(f"Saved! ({len(st.session_state.comparison_runs)} runs stored)")
+                            st.success("Saved!")
 
             elif "last_metabase_result" in st.session_state:
                 render_results(st.session_state["last_metabase_result"])
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 3: Compare Runs
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── TAB 3: Compare Runs ─────────────────────────────────────────────────────
+
 with tab_compare:
     st.subheader("Compare Simulation Runs")
     runs = st.session_state.comparison_runs
 
     if len(runs) < 1:
-        st.info("Run simulations and click '📌 Save to Comparison' to start comparing.")
+        st.info("Run simulations and click '📌 Save to Comparison' "
+                "to start comparing.")
     else:
-        st.caption(f"{len(runs)} runs saved. Select two to compare side-by-side.")
+        st.caption(f"{len(runs)} runs saved.")
+        run_labels = [
+            f"Run {i + 1}: {r.get('label', 'Manual')} "
+            f"({r['players']}p, ${r['pool']:,.0f})"
+            for i, r in enumerate(runs)
+        ]
 
-        run_labels = [f"Run {i+1}: {r.get('label', 'Manual')} ({r['players']}p, ${r['pool']:,.0f})" for i, r in enumerate(runs)]
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            idx_a = st.selectbox("Run A", range(len(runs)),
+                                 format_func=lambda i: run_labels[i])
+        with cc2:
+            idx_b = st.selectbox("Run B", range(len(runs)),
+                                 index=min(1, len(runs) - 1),
+                                 format_func=lambda i: run_labels[i])
 
-        ccol1, ccol2 = st.columns(2)
-        with ccol1:
-            idx_a = st.selectbox("Run A", range(len(runs)), format_func=lambda i: run_labels[i])
-        with ccol2:
-            idx_b = st.selectbox("Run B", range(len(runs)), index=min(1, len(runs)-1), format_func=lambda i: run_labels[i])
+        run_a, run_b = runs[idx_a], runs[idx_b]
 
-        run_a = runs[idx_a]
-        run_b = runs[idx_b]
-
-        # Side-by-side metrics
-        st.markdown("---")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Tiers", f"{run_a['k']} vs {run_b['k']}")
-        avg_a = run_a['pool'] / run_a['players']
-        avg_b = run_b['pool'] / run_b['players']
-        m2.metric("Avg Bounty", f"${avg_a:,.2f} vs ${avg_b:,.2f}")
-        ratio_a = run_a['vals'][-1] / run_a['vals'][0]
-        ratio_b = run_b['vals'][-1] / run_b['vals'][0]
-        m3.metric("Max/Min Ratio", f"{ratio_a:,.1f}x vs {ratio_b:,.1f}x")
-        m4.metric("Top-3 Players",
-                   f"{sum(run_a['counts'][-3:])} vs {sum(run_b['counts'][-3:])}")
+        m2.metric("Avg Bounty",
+                   f"${run_a['pool'] / run_a['players']:,.0f} vs "
+                   f"${run_b['pool'] / run_b['players']:,.0f}")
+        ra_ratios = [run_a['vals'][i + 1] / run_a['vals'][i]
+                     for i in range(run_a['k'] - 1)]
+        rb_ratios = [run_b['vals'][i + 1] / run_b['vals'][i]
+                     for i in range(run_b['k'] - 1)]
+        m3.metric("Start Mult",
+                   f"{ra_ratios[0]:.2f}x vs {rb_ratios[0]:.2f}x")
+        m4.metric("End Mult",
+                   f"{ra_ratios[-1]:.2f}x vs {rb_ratios[-1]:.2f}x")
 
-        # Overlay chart — bounty values
-        fig_compare = go.Figure()
-        fig_compare.add_trace(go.Bar(
-            name=f"A: {run_a.get('label', 'Run A')}",
-            x=[f"L{i+1}" for i in range(run_a['k'])],
-            y=run_a['vals'],
-            marker_color="#58a6ff",
-            opacity=0.7,
+        # Overlay chart
+        fig_cmp = go.Figure()
+        fig_cmp.add_trace(go.Bar(
+            name=f"A: {run_a.get('label', 'A')}",
+            x=[f"L{i + 1}" for i in range(run_a['k'])],
+            y=run_a['vals'], marker_color="#58a6ff", opacity=0.7,
         ))
-        fig_compare.add_trace(go.Bar(
-            name=f"B: {run_b.get('label', 'Run B')}",
-            x=[f"L{i+1}" for i in range(run_b['k'])],
-            y=run_b['vals'],
-            marker_color="#f0883e",
-            opacity=0.7,
+        fig_cmp.add_trace(go.Bar(
+            name=f"B: {run_b.get('label', 'B')}",
+            x=[f"L{i + 1}" for i in range(run_b['k'])],
+            y=run_b['vals'], marker_color="#f0883e", opacity=0.7,
         ))
-        fig_compare.update_layout(
+        fig_cmp.update_layout(
             title="Bounty Values — Side by Side",
-            barmode="group",
-            template="plotly_dark",
-            height=400,
+            barmode="group", template="plotly_dark", height=400,
         )
-        st.plotly_chart(fig_compare, use_container_width=True)
+        st.plotly_chart(fig_cmp, use_container_width=True)
 
-        # Multiplier comparison chart
+        # Multiplier comparison
         if run_a['k'] >= 3 and run_b['k'] >= 3:
-            mults_a = [run_a['vals'][i] / run_a['vals'][i-1] for i in range(1, run_a['k'])]
-            mults_b = [run_b['vals'][i] / run_b['vals'][i-1] for i in range(1, run_b['k'])]
-
-            fig_mults = go.Figure()
-            fig_mults.add_trace(go.Scatter(
-                name=f"A: {run_a.get('label', 'Run A')}",
-                x=[f"L{i}→L{i+1}" for i in range(1, run_a['k'])],
-                y=mults_a,
-                mode="lines+markers",
-                line=dict(color="#58a6ff", width=2),
+            fig_m = go.Figure()
+            fig_m.add_trace(go.Scatter(
+                name="A", mode="lines+markers",
+                x=[f"L{i}→L{i + 1}" for i in range(1, run_a['k'])],
+                y=ra_ratios, line=dict(color="#58a6ff", width=2),
             ))
-            fig_mults.add_trace(go.Scatter(
-                name=f"B: {run_b.get('label', 'Run B')}",
-                x=[f"L{i}→L{i+1}" for i in range(1, run_b['k'])],
-                y=mults_b,
-                mode="lines+markers",
-                line=dict(color="#f0883e", width=2),
+            fig_m.add_trace(go.Scatter(
+                name="B", mode="lines+markers",
+                x=[f"L{i}→L{i + 1}" for i in range(1, run_b['k'])],
+                y=rb_ratios, line=dict(color="#f0883e", width=2),
             ))
-            fig_mults.update_layout(
-                title="Multiplier Progression Comparison",
-                xaxis_title="Tier Transition",
-                yaxis_title="Multiplier",
-                template="plotly_dark",
-                height=300,
+            fig_m.update_layout(
+                title="Multiplier Progression",
+                template="plotly_dark", height=300,
             )
-            st.plotly_chart(fig_mults, use_container_width=True)
+            st.plotly_chart(fig_m, use_container_width=True)
 
-        # Parameter diff table
+        # Param diff table
         st.subheader("Parameter Comparison")
-        params_a = run_a.get("params", {})
-        params_b = run_b.get("params", {})
-        all_keys = sorted(set(list(params_a.keys()) + list(params_b.keys())))
-        diff_rows = []
-        for key in all_keys:
-            va = params_a.get(key, "—")
-            vb = params_b.get(key, "—")
-            diff_rows.append({"Parameter": key, "Run A": str(va), "Run B": str(vb), "Changed": "✅" if va != vb else ""})
-        st.dataframe(pd.DataFrame(diff_rows), use_container_width=True, hide_index=True)
+        pa = run_a.get("params", {})
+        pb = run_b.get("params", {})
+        all_keys = sorted(set(list(pa.keys()) + list(pb.keys())))
+        diff_rows = [{"Parameter": k, "Run A": str(pa.get(k, "—")),
+                       "Run B": str(pb.get(k, "—")),
+                       "Changed": "✅" if pa.get(k) != pb.get(k) else ""}
+                      for k in all_keys]
+        st.dataframe(pd.DataFrame(diff_rows), use_container_width=True,
+                     hide_index=True)
 
         if st.button("🗑️ Clear all runs"):
             st.session_state.comparison_runs = []
             st.rerun()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4: Code Editor — Edit & Deploy this app directly
-# ═══════════════════════════════════════════════════════════════════════════════
-# Shows only the simulator-logic sections (engine, SQL, CSS) — not UI boilerplate.
-# Edits are merged back into the full file and pushed to GitHub.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-GITHUB_REPO = "sulemansafdar-rgb/mystery-bounty-simulator"
-GITHUB_FILE = "mystery_bounty_app.py"
-GITHUB_BRANCH = "main"
-
-# --- Section definitions: (label, start_pattern, end_pattern) ---
-# Each section is extracted from start_pattern up to (but not including) end_pattern.
-EDITABLE_SECTIONS = [
-    ("🎯 Tier Recommendation (recommend_k)",
-     "    def recommend_k(self):", "    def _generate_weights(self, k):"),
-    ("📊 Distribution Weights (_generate_weights)",
-     "    def _generate_weights(self, k):", "    def _allocate_players(self, k):"),
-    ("👥 Player Allocation (_allocate_players)",
-     "    def _allocate_players(self, k):", "    def _generate_ideal_values(self, k):"),
-    ("💡 Ideal Value Generation (_generate_ideal_values)",
-     "    def _generate_ideal_values(self, k):", "    def build(self, k=None):"),
-    ("🏗️ Build Pipeline (build)",
-     "    def build(self, k=None):", "\n\n# ─────"),
-    ("🔌 SQL: Bounty Tournament Query",
-     "BOUNTY_TOURNAMENT_QUERY = \"\"\"", "ALL_TOURNAMENT_QUERY = \"\"\""),
-    ("🔌 SQL: All Tournament Query",
-     "ALL_TOURNAMENT_QUERY = \"\"\"", "\n\n# ─────"),
-    ("🎨 CSS & Styling",
-     "# Custom CSS\nst.markdown(\"\"\"", "\"\"\", unsafe_allow_html=True)"),
-]
-
-
-def extract_section(full_code: str, start: str, end: str) -> tuple:
-    """Extract a section of code between start and end patterns.
-    Returns (section_text, start_idx, end_idx) or (None, -1, -1) if not found.
-    """
-    s = full_code.find(start)
-    if s == -1:
-        return None, -1, -1
-    e = full_code.find(end, s + len(start))
-    if e == -1:
-        e = len(full_code)
-    return full_code[s:e], s, e
-
-
-def replace_section(full_code: str, start_idx: int, end_idx: int, new_text: str) -> str:
-    """Replace a section in the full code."""
-    return full_code[:start_idx] + new_text + full_code[end_idx:]
-
-
-def github_load_file(token: str) -> tuple:
-    """Load a file from GitHub. Returns (content, sha) or (None, error_msg)."""
-    import requests as _req
-    import base64 as _b64
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}?ref={GITHUB_BRANCH}"
-    try:
-        resp = _req.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return _b64.b64decode(data["content"]).decode("utf-8"), data["sha"]
-    except Exception as e:
-        return None, str(e)
-
-
-def github_push_file(token: str, content: str, sha: str, message: str = "") -> tuple:
-    """Push updated file to GitHub. Returns (success, new_sha_or_error)."""
-    import requests as _req
-    import base64 as _b64
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
-               "Accept": "application/vnd.github.v3+json"}
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
-    payload = {
-        "message": message or "Update simulator logic via Code Editor",
-        "content": _b64.b64encode(content.encode("utf-8")).decode("ascii"),
-        "sha": sha, "branch": GITHUB_BRANCH,
-    }
-    try:
-        resp = _req.put(url, json=payload, headers=headers, timeout=30)
-        if resp.status_code in (200, 201):
-            return True, resp.json()["content"]["sha"]
-        return False, f"GitHub error {resp.status_code}: {resp.json().get('message', '')}"
-    except Exception as e:
-        return False, str(e)
-
-
-with tab_editor:
-    st.subheader("✏️ Code Editor — Edit & Deploy")
-    st.caption(
-        "Edit the mystery bounty simulator logic below. "
-        "Only the core logic sections are shown — UI boilerplate is hidden. "
-        "Changes are merged into the full file and pushed to GitHub."
-    )
-
-    # --- GitHub Token (auto-load from secrets) ---
-    gh_secrets_token = ""
-    try:
-        gh_secrets_token = st.secrets.get("GITHUB_PAT", "")
-    except Exception:
-        pass
-    if gh_secrets_token and "github_pat" not in st.session_state:
-        st.session_state["github_pat"] = gh_secrets_token
-
-    gh_token = st.text_input(
-        "GitHub Personal Access Token",
-        type="password",
-        value=st.session_state.get("github_pat", ""),
-        help="Auto-loaded from Streamlit Secrets (GITHUB_PAT). Or paste manually.",
-    )
-    if gh_token:
-        st.session_state["github_pat"] = gh_token
-
-    if not gh_token:
-        st.info(
-            "🔑 **Setup required:** Enter a GitHub Personal Access Token above.\n\n"
-            "**Quick setup:** Go to [github.com/settings/tokens](https://github.com/settings/tokens?type=beta) "
-            "→ Generate new token → Select 'mystery-bounty-simulator' repo → Contents: Read & Write → Generate."
-        )
-    else:
-        # --- Load / Push buttons ---
-        ecol1, ecol2, ecol3 = st.columns([1, 1, 2])
-        with ecol1:
-            load_btn = st.button("📥 Load from GitHub", use_container_width=True)
-        with ecol2:
-            push_btn = st.button("🚀 Push & Deploy", type="primary", use_container_width=True)
-        with ecol3:
-            commit_msg = st.text_input(
-                "Commit message", value="Update simulator logic via Code Editor",
-                label_visibility="collapsed", placeholder="Commit message",
-            )
-
-        # --- Load ---
-        if load_btn:
-            with st.spinner("Loading from GitHub..."):
-                content, sha_or_err = github_load_file(gh_token)
-            if content is not None:
-                st.session_state["editor_full_code"] = content
-                st.session_state["editor_sha"] = sha_or_err
-                st.session_state["editor_loaded"] = True
-                # Extract all sections
-                for i, (label, start_pat, end_pat) in enumerate(EDITABLE_SECTIONS):
-                    section_text, _, _ = extract_section(content, start_pat, end_pat)
-                    if section_text is not None:
-                        st.session_state[f"section_{i}_original"] = section_text
-                st.success(f"✅ Loaded! Showing {len(EDITABLE_SECTIONS)} editable logic sections.")
-            else:
-                st.error(f"Load failed: {sha_or_err}")
-
-        # --- Show section editors ---
-        if st.session_state.get("editor_loaded"):
-            st.divider()
-            st.caption("**Select a section to edit** — only simulator logic is shown, UI code is hidden.")
-
-            # Section selector
-            section_labels = [s[0] for s in EDITABLE_SECTIONS]
-            selected_section = st.selectbox("Section", section_labels, key="section_picker")
-            section_idx = section_labels.index(selected_section)
-
-            label, start_pat, end_pat = EDITABLE_SECTIONS[section_idx]
-            original_section = st.session_state.get(f"section_{section_idx}_original", "")
-
-            if original_section:
-                line_count = original_section.count("\n") + 1
-                st.caption(f"**{label}** — {line_count} lines")
-
-                # Editable text area for this section
-                edited_section = st.text_area(
-                    f"Edit: {label}",
-                    value=original_section,
-                    height=max(200, min(600, line_count * 18)),
-                    key=f"editor_section_{section_idx}",
-                    label_visibility="collapsed",
-                )
-
-                # Show change indicator
-                if edited_section != original_section:
-                    char_diff = len(edited_section) - len(original_section)
-                    st.caption(f"📝 **Unsaved changes:** {'+' if char_diff >= 0 else ''}{char_diff} chars")
-            else:
-                st.warning(f"Section '{label}' not found in the code. Pattern may have changed.")
-                edited_section = original_section
-
-            # --- Push ---
-            if push_btn:
-                full_code = st.session_state.get("editor_full_code", "")
-                sha = st.session_state.get("editor_sha")
-                if not sha or not full_code:
-                    st.error("Load the code from GitHub first.")
-                else:
-                    # Merge the edited section back into full code
-                    _, s_idx, e_idx = extract_section(full_code, start_pat, end_pat)
-                    if s_idx == -1:
-                        st.error("Could not locate section in full code. Try reloading.")
-                    elif edited_section == original_section:
-                        st.warning("No changes to push.")
-                    else:
-                        merged = replace_section(full_code, s_idx, e_idx, edited_section)
-
-                        # Validate Python syntax before pushing
-                        import ast as _ast
-                        try:
-                            _ast.parse(merged)
-                        except SyntaxError as syn_err:
-                            st.error(f"⚠️ **Syntax error — not pushed.** Fix before deploying:\n\n`{syn_err}`")
-                            merged = None
-
-                        if merged:
-                            with st.spinner("Pushing to GitHub..."):
-                                success, result = github_push_file(gh_token, merged, sha, commit_msg)
-                            if success:
-                                st.session_state["editor_full_code"] = merged
-                                st.session_state["editor_sha"] = result
-                                st.session_state[f"section_{section_idx}_original"] = edited_section
-                                st.success(
-                                    "✅ **Pushed!** Streamlit Cloud will auto-deploy in ~1 minute. "
-                                    "Refresh the app to see your changes."
-                                )
-                                st.balloons()
-                            else:
-                                st.error(f"Push failed: {result}")
-
-            # --- Full code toggle (advanced) ---
-            with st.expander("🔧 Advanced: View/Edit Full Code"):
-                st.caption("⚠️ This shows the entire file including Streamlit UI code. Edit with care.")
-                full_code_display = st.text_area(
-                    "Full source code",
-                    value=st.session_state.get("editor_full_code", ""),
-                    height=400,
-                    key="full_code_area",
-                    label_visibility="collapsed",
-                )
-                if st.button("🚀 Push Full Code", key="push_full"):
-                    sha = st.session_state.get("editor_sha")
-                    if not sha:
-                        st.error("Load first.")
-                    else:
-                        import ast as _ast
-                        try:
-                            _ast.parse(full_code_display)
-                        except SyntaxError as syn_err:
-                            st.error(f"Syntax error: {syn_err}")
-                            full_code_display = None
-                        if full_code_display:
-                            with st.spinner("Pushing full code..."):
-                                success, result = github_push_file(
-                                    gh_token, full_code_display, sha, commit_msg
-                                )
-                            if success:
-                                st.session_state["editor_full_code"] = full_code_display
-                                st.session_state["editor_sha"] = result
-                                st.success("✅ Full code pushed!")
-                                st.balloons()
-                            else:
-                                st.error(f"Push failed: {result}")
-        else:
-            st.info("Click **📥 Load from GitHub** to start editing.")
