@@ -156,6 +156,12 @@ class BountyArchitect:
 
     # ── Scoring ──────────────────────────────────────────────────────────
 
+    # Preferred top patterns — lower index = more preferred
+    PREFERRED_TOPS = [
+        [1, 3, 6], [1, 3, 5], [1, 2, 5], [1, 2, 4], [1, 2, 3],
+        [1, 3, 7], [1, 3, 8], [1, 4, 7], [1, 4, 8], [1, 2, 6],
+    ]
+
     @staticmethod
     def _score(vals, counts, pool, mult_start_target):
         """Score a candidate distribution. Lower is better.
@@ -165,6 +171,7 @@ class BountyArchitect:
           - Ratio monotonicity (must be increasing)
           - First ratio deviation from target start_mult
           - Count cliff factor (L1/L2 vs L2/L3 ratio)
+          - Top-pattern linearity (prefer [1,3,6] style)
         """
         k = len(vals)
         total = sum(v * c for v, c in zip(vals, counts))
@@ -184,10 +191,18 @@ class BountyArchitect:
         r23 = counts[1] / counts[2] if counts[2] > 0 else 999
         cliff = r12 / r23 if r23 > 0 else 999
 
+        # Top-pattern preference: favor small, clean top-tier counts
+        # [1,3,6]=sum 10 vs [1,4,7]=sum 12 vs [1,3,8]=sum 12
+        # Also penalize L1 absorbing too many players (>50% of total)
+        top3_sum = sum(counts[-3:])
+        l1_share = counts[0] / sum(counts) if sum(counts) > 0 else 0
+
         score = (drift * 15
                  + n_dec * 80
-                 + first_dev * 15
-                 + max(0, cliff - 2.5) * 30)
+                 + first_dev * 5
+                 + max(0, cliff - 2.5) * 30
+                 + max(0, top3_sum - 10) * 0.3
+                 + max(0, l1_share - 0.45) * 10)
 
         return score, drift, ratios, n_dec
 
@@ -267,7 +282,7 @@ class BountyArchitect:
 
         max_lo = round(self.max_val * 0.80 / d) * d
         max_hi = round(self.max_val * 1.20 / d) * d
-        max_step = max(d, round((max_hi - max_lo) / 10 / d) * d)
+        max_step = max(d, round((max_hi - max_lo) / 20 / d) * d)
         max_range = list(range(max(d, max_lo), max_hi + max_step, max_step))
         if not max_range:
             max_range = [round(self.max_val / d) * d]
