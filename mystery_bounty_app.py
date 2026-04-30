@@ -881,10 +881,11 @@ def render_results(result):
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-tab_manual, tab_metabase, tab_compare = st.tabs([
+tab_manual, tab_metabase, tab_compare, tab_code = st.tabs([
     "📝 Manual Simulator",
     "🔌 Load from CoinPoker",
     "🔄 Compare Runs",
+    "💻 Code Editor",
 ])
 
 # ─── TAB 1: Manual Simulator ─────────────────────────────────────────────────
@@ -1194,3 +1195,88 @@ with tab_compare:
         if st.button("🗑️ Clear all runs"):
             st.session_state.comparison_runs = []
             st.rerun()
+
+
+# ─── TAB 4: Code Editor ──────────────────────────────────────────────────────
+
+# Engine source boundaries (line numbers in THIS file, 0-indexed)
+_ENGINE_START_MARKER = "class BountyArchitect:"
+_ENGINE_END_MARKER = "\n\n# ─────────────────────────────────────────────────────────────────────────────\n# SECTION 2: METABASE CLIENT"
+
+with tab_code:
+    st.subheader("Engine Source — BountyArchitect v18")
+    st.caption(
+        "Edit the engine code below and click **Apply & Re-run** to test changes live. "
+        "Changes persist for this session only — reload the app to reset."
+    )
+
+    # Load current source
+    _this_file = __file__
+    with open(_this_file, "r") as _f:
+        _full_source = _f.read()
+
+    # Extract engine class source
+    _eng_start = _full_source.index(_ENGINE_START_MARKER)
+    _eng_end = _full_source.index(
+        "# ─────────────────────────────────────────────────────────────────────────────\n# SECTION 2: METABASE CLIENT"
+    )
+    _engine_source = _full_source[_eng_start:_eng_end].rstrip()
+
+    if "editor_code" not in st.session_state:
+        st.session_state.editor_code = _engine_source
+
+    edited_code = st.text_area(
+        "Engine Code",
+        value=st.session_state.editor_code,
+        height=600,
+        key="code_editor_area",
+        label_visibility="collapsed",
+    )
+
+    col_apply, col_reset, col_download = st.columns([2, 1, 1])
+
+    with col_apply:
+        if st.button("▶️ Apply & Re-run", type="primary", use_container_width=True):
+            try:
+                # Validate syntax
+                compile(edited_code, "<code-editor>", "exec")
+
+                # Write modified source back to file
+                new_source = (
+                    _full_source[:_eng_start]
+                    + edited_code.rstrip()
+                    + "\n\n"
+                    + _full_source[_eng_end:]
+                )
+                with open(_this_file, "w") as _fw:
+                    _fw.write(new_source)
+
+                st.session_state.editor_code = edited_code
+                st.success("Code applied — reloading app...")
+                st.rerun()
+
+            except SyntaxError as e:
+                st.error(f"Syntax error on line {e.lineno}: {e.msg}")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    with col_reset:
+        if st.button("🔄 Reset to Default", use_container_width=True):
+            # Re-read original from file
+            with open(_this_file, "r") as _f:
+                _current = _f.read()
+            _cs = _current.index(_ENGINE_START_MARKER)
+            _ce = _current.index(
+                "# ─────────────────────────────────────────────────────────────────────────────\n# SECTION 2: METABASE CLIENT"
+            )
+            st.session_state.editor_code = _current[_cs:_ce].rstrip()
+            st.rerun()
+
+    with col_download:
+        st.download_button(
+            "⬇️ Download .py",
+            data=edited_code,
+            file_name="bounty_architect_v18.py",
+            mime="text/x-python",
+            use_container_width=True,
+        )
