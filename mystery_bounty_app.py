@@ -8,7 +8,7 @@ Usage:
     streamlit run mystery_bounty_app.py
 
 Engine: BountyArchitect v18 — Power-Curve with Auto-Optimisation
-Inputs: pool, players, min_bounty, max_bounty, start_multiplier
+Inputs: pool, players, min_bounty (pinned), max_bounty (±10% flex)
 Engine auto-discovers: K, end_multiplier, top-tier pattern, count shape
 
 Metabase integration: loads real tournament data from cp_prod (DB 133, Athena)
@@ -42,9 +42,9 @@ import plotly.express as px
 #   4. Counts use top-pattern + smooth exponential decay for lower tiers.
 #
 # PARAMETER RELAXATION (built into engine, not user-facing):
-#   - Min bounty: ±10% of user input
-#   - Max bounty: ±20% of user input
-#   - Start multiplier: ±10% of user input
+#   - Min bounty: pinned exactly (guaranteed minimum, no flex)
+#   - Max bounty: ±10% flex only if exact value yields no solution
+#   - Start multiplier: fixed at 2.0
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BountyArchitect:
@@ -56,21 +56,37 @@ class BountyArchitect:
     Parameters:
         pool (float)       : Total bounty pool in USDT
         players (int)      : Number of players receiving bounties
-        min_bounty (float) : Target smallest bounty (engine may flex ±10%)
-        max_bounty (float) : Target largest bounty (engine may flex ±20%)
-        mult_start (float) : Target starting multiplier (engine may flex ±10%)
+        min_bounty (float) : Guaranteed smallest bounty (pinned exactly, no flex)
+        max_bounty (float) : Target largest bounty (±10% flex if no exact solution)
+
+    Fixed:
+        mult_start = 2.0   : Starting multiplier (L1→L2 ratio target)
+        DENOM              : Adaptive — 10 for min≥10, smaller for small min values
     """
 
-    DENOM = 10  # Values snap to nearest $10
+    MULT_START = 2.0  # Fixed starting multiplier
 
-    # Top-tier count patterns to search (reversed: [top, 2nd, 3rd])
+    # Top-tier count patterns: CAPPED at [1, ≤3, ≤6]
+    # 2nd-last tier max 3 players, 3rd-last tier max 6 players
     TOP_PATTERNS = [
         [1, 2, 3], [1, 2, 4], [1, 2, 5], [1, 2, 6],
-        [1, 3, 5], [1, 3, 6], [1, 3, 7], [1, 3, 8],
-        [1, 4, 7], [1, 4, 8],
+        [1, 3, 5], [1, 3, 6],
     ]
 
-    def __init__(self, pool, players, min_bounty, max_bounty, mult_start=2.0):
+    @staticmethod
+    def _calc_denom(min_bounty):
+        """Adaptive denomination for clean value snapping.
+
+        Uses $5 increments for small min values (produces $15, $30, $65
+        instead of $12, $28, $68). Uses $10 for min≥$10.
+        """
+        if min_bounty >= 10 and min_bounty % 10 == 0:
+            return 10
+        if min_bounty % 5 == 0:
+            return 5
+        return 5  # Default to $5 snapping for cleaner values
+
+    def __init__(self, pool, players, min_bounty, max_bounty):
         if pool <= 0 or players <= 0:
             raise ValueError("Pool and players must be > 0")
         if players * min_bounty > pool:
@@ -82,7 +98,8 @@ class BountyArchitect:
         self.players = players
         self.min_val = min_bounty
         self.max_val = max_bounty
-        self.mult_start = mult_start
+        self.mult_start = self.MULT_START
+        self.DENOM = self._calc_denom(min_bounty)
         self.warnings = []
 
     # ── Value generation via power curve ──────────────────────────────────
@@ -93,7 +110,7 @@ class BountyArchitect:
         α > 1 produces increasing tier-to-tier ratios (slow start,
         fast finish), which is the desired shape.
 
-        Returns list of k values snapped to DENOM, or None if invalid.
+        Returns list of k values snapped to DENOM.
         """
         d = self.DENOM
         vals = []
@@ -110,11 +127,12 @@ class BountyArchitect:
             if vals[i] <= vals[i - 1]:
                 vals[i] = vals[i - 1] + d
 
-        # Validate final value didn't drift too far from max
+        # Clamp last value back to mx without discarding candidate
         if vals[-1] != mx:
-            vals[-1] = mx
-            if vals[-1] <= vals[-2]:
-                return None
+            if vals[-2] < mx:
+                vals[-1] = mx
+            else:
+                vals[-1] = vals[-2] + d
 
         return vals
 
@@ -157,9 +175,10 @@ class BountyArchitect:
     # ── Scoring ──────────────────────────────────────────────────────────
 
     # Preferred top patterns — lower index = more preferred
+    # All capped at [1, ≤3, ≤6]
     PREFERRED_TOPS = [
         [1, 3, 6], [1, 3, 5], [1, 2, 5], [1, 2, 4], [1, 2, 3],
-        [1, 3, 7], [1, 3, 8], [1, 4, 7], [1, 4, 8], [1, 2, 6],
+        [1, 2, 6],
     ]
 
     @staticmethod
@@ -179,11 +198,12 @@ class BountyArchitect:
 
         ratios = [vals[i + 1] / vals[i] for i in range(k - 1)]
 
-        # Count ratio decreases (should be 0 for increasing ratios)
-        n_dec = sum(1 for i in range(len(ratios) - 1)
+        # Count ratio decreases from index 1 onward (skip first ratio
+        # which may spike due to DENOM snapping on small min values)
+        n_dec = sum(1 for i in range(1, len(ratios) - 1)
                     if ratios[i + 1] < ratios[i] - 0.02)
 
-        # First ratio deviation from target
+        # First ratio deviation from target (lenient for small values)
         first_dev = abs(ratios[0] - mult_start_target)
 
         # Count cliff: L1/L2 vs L2/L3
@@ -273,19 +293,16 @@ class BountyArchitect:
         """
         d = self.DENOM
 
-        # Define search ranges with parameter relaxation
-        min_lo = round(self.min_val * 0.90 / d) * d
-        min_hi = round(self.min_val * 1.10 / d) * d
-        min_range = list(range(max(d, min_lo), min_hi + d, d))
-        if not min_range:
-            min_range = [round(self.min_val / d) * d]
+        # Min bounty: pinned exactly (guaranteed minimum, no flex)
+        min_range = [self.min_val]
 
-        max_lo = round(self.max_val * 0.80 / d) * d
-        max_hi = round(self.max_val * 1.20 / d) * d
-        max_step = max(d, round((max_hi - max_lo) / 20 / d) * d)
-        max_range = list(range(max(d, max_lo), max_hi + max_step, max_step))
-        if not max_range:
-            max_range = [round(self.max_val / d) * d]
+        # Max bounty: try exact first; ±10% flex only if no solution found
+        max_exact = round(self.max_val / d) * d
+        max_lo = round(self.max_val * 0.90 / d) * d
+        max_hi = round(self.max_val * 1.10 / d) * d
+        max_step = max(d, round((max_hi - max_lo) / 20 / d) * d) or d
+        max_range_exact = [max_exact]
+        max_range_flex = list(range(max(d, max_lo), max_hi + max_step, max_step))
 
         # Adaptive drift tolerance: tighter pools get stricter limits
         # avg_bounty / max_bounty ratio indicates how top-heavy the pool is
@@ -296,59 +313,71 @@ class BountyArchitect:
         best_score = float('inf')
         best_result = None
 
-        for K in range(5, 11):
-            for top in self.TOP_PATTERNS:
-                for steep_x10 in range(13, 28, 2):
-                    steep = steep_x10 / 10.0
-                    counts = self._build_counts(K, top, steep)
-                    if counts is None:
-                        continue
+        # Two-pass: try exact max first, then ±10% flex if needed
+        for max_range in [max_range_exact, max_range_flex]:
+            if best_result is not None:
+                break  # found solution with exact max
 
-                    for mn in min_range:
-                        for mx in max_range:
-                            if mx <= mn:
-                                continue
+            for K in range(5, 13):
+                for top in self.TOP_PATTERNS:
+                    for steep_x10 in range(13, 28, 2):
+                        steep = steep_x10 / 10.0
+                        counts = self._build_counts(K, top, steep)
+                        if counts is None:
+                            continue
 
-                            for alpha_x10 in range(11, 35, 1):
-                                alpha = alpha_x10 / 10.0
-                                vals = self._power_curve_values(K, mn, mx, alpha)
-                                if vals is None:
+                        for mn in min_range:
+                            for mx in max_range:
+                                if mx <= mn:
                                     continue
 
-                                # Quick checks before full scoring
-                                ratios = [vals[i + 1] / vals[i]
-                                          for i in range(K - 1)]
+                                for alpha_x10 in range(8, 35, 1):
+                                    alpha = alpha_x10 / 10.0
+                                    vals = self._power_curve_values(
+                                        K, mn, mx, alpha)
+                                    if vals is None:
+                                        continue
 
-                                # First ratio must be within ±20% of target
-                                if not (self.mult_start * 0.80 <= ratios[0]
-                                        <= self.mult_start * 1.20):
-                                    continue
+                                    # Quick checks before full scoring
+                                    ratios = [vals[i + 1] / vals[i]
+                                              for i in range(K - 1)]
 
-                                # Ratios should be roughly increasing
-                                n_dec = sum(
-                                    1 for i in range(len(ratios) - 1)
-                                    if ratios[i + 1] < ratios[i] - 0.02
-                                )
-                                if n_dec > 1:
-                                    continue
+                                    # First ratio: wider tolerance for small
+                                    # min values where DENOM snapping causes
+                                    # natural jumps (e.g. $6→$15 = 2.5x)
+                                    r0_lo = self.mult_start * 0.75
+                                    r0_hi = self.mult_start * 1.40
+                                    if not (r0_lo <= ratios[0] <= r0_hi):
+                                        continue
 
-                                score, drift, _, _ = self._score(
-                                    vals, counts, self.pool, self.mult_start)
+                                    # Ratios should be roughly increasing
+                                    # (skip first — DENOM snapping on small
+                                    # min values causes natural spike)
+                                    n_dec = sum(
+                                        1 for i in range(1, len(ratios) - 1)
+                                        if ratios[i + 1] < ratios[i] - 0.02
+                                    )
+                                    if n_dec > 1:
+                                        continue
 
-                                if drift > drift_tolerance:
-                                    continue
+                                    score, drift, _, _ = self._score(
+                                        vals, counts, self.pool,
+                                        self.mult_start)
 
-                                if score < best_score:
-                                    best_score = score
-                                    best_result = {
-                                        'k': K,
-                                        'vals': vals[:],
-                                        'counts': counts[:],
-                                        'top': top,
-                                        'alpha': alpha,
-                                        'mn': mn,
-                                        'mx': mx,
-                                    }
+                                    if drift > drift_tolerance:
+                                        continue
+
+                                    if score < best_score:
+                                        best_score = score
+                                        best_result = {
+                                            'k': K,
+                                            'vals': vals[:],
+                                            'counts': counts[:],
+                                            'top': top,
+                                            'alpha': alpha,
+                                            'mn': mn,
+                                            'mx': mx,
+                                        }
 
         if best_result is None:
             # Fallback: use simple geometric with original params
@@ -378,50 +407,47 @@ class BountyArchitect:
     def _fallback_build(self):
         """Pool-aware geometric fallback if power-curve search fails.
 
-        Iteratively adjusts max bounty downward (and min up if needed)
-        until pool drift < 5%. Reports adjusted params as warnings.
+        Min bounty stays pinned. Max bounty scales down within ±10%.
+        Reports adjusted params as warnings.
         """
         d = self.DENOM
         best_fb = None
         avg = self.pool / self.players
 
-        # Try scaling max down and min up
-        # For small pools, min may need to rise significantly
-        mn_mults = [1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0]
+        # Min pinned exactly; only flex max bounty ±10%
+        mn = self.min_val
+        if mn >= avg:
+            mn = max(d, round(avg * 0.1 / d) * d)
         for k in range(7, 4, -1):
-            for mn_mult in mn_mults:
-                mn = round(self.min_val * mn_mult / d) * d or d
-                if mn >= avg:
+            for mx_mult in [x / 100.0 for x in range(100, 89, -2)]:
+                mx = round(self.max_val * mx_mult / d) * d
+                if mx <= mn * 3 or mx <= avg:
                     continue
-                for mx_mult in [x / 100.0 for x in range(100, 9, -5)]:
-                    mx = round(self.max_val * mx_mult / d) * d
-                    if mx <= mn * 3 or mx <= avg:
+
+                ratio = (mx / mn) ** (1.0 / (k - 1))
+                vals = [mn]
+                for i in range(1, k):
+                    vals.append(round(vals[-1] * ratio / d) * d)
+                vals[0] = mn
+                vals[-1] = mx
+                for i in range(1, k):
+                    if vals[i] <= vals[i - 1]:
+                        vals[i] = vals[i - 1] + d
+
+                for tp in self.TOP_PATTERNS[:6]:
+                    if len(tp) > k:
                         continue
-
-                    ratio = (mx / mn) ** (1.0 / (k - 1))
-                    vals = [mn]
-                    for i in range(1, k):
-                        vals.append(round(vals[-1] * ratio / d) * d)
-                    vals[0] = mn
-                    vals[-1] = mx
-                    for i in range(1, k):
-                        if vals[i] <= vals[i - 1]:
-                            vals[i] = vals[i - 1] + d
-
-                    for tp in self.TOP_PATTERNS[:6]:
-                        if len(tp) > k:
+                    for steep in [1.3, 1.5, 2.0, 2.5]:
+                        counts = self._build_counts(k, tp, steep)
+                        if counts is None:
                             continue
-                        for steep in [1.3, 1.5, 2.0, 2.5]:
-                            counts = self._build_counts(k, tp, steep)
-                            if counts is None:
-                                continue
 
-                            total = sum(v * c for v, c in zip(vals, counts))
-                            drift = abs(total - self.pool) / self.pool * 100
+                        total = sum(v * c for v, c in zip(vals, counts))
+                        drift = abs(total - self.pool) / self.pool * 100
 
-                            if best_fb is None or drift < best_fb[0]:
-                                best_fb = (drift, k, vals[:], counts[:],
-                                           mn, mx, tp)
+                        if best_fb is None or drift < best_fb[0]:
+                            best_fb = (drift, k, vals[:], counts[:],
+                                       mn, mx, tp)
 
         if best_fb and best_fb[0] < 20:
             _, k, vals, counts, mn, mx, tp = best_fb
@@ -635,14 +661,14 @@ with st.sidebar:
     st.caption(
         "**BountyArchitect v18** — Power-Curve\n\n"
         "The engine automatically determines:\n"
-        "- Number of tiers (K)\n"
+        "- Number of tiers (K=5–12)\n"
         "- End multiplier\n"
-        "- Top-tier count pattern\n"
+        "- Top-tier pattern (capped [1,≤3,≤6])\n"
         "- Count curve steepness\n\n"
-        "Parameter relaxation:\n"
-        "- Min bounty: ±10%\n"
-        "- Max bounty: ±20%\n"
-        "- Start multiplier: ±10%"
+        "Parameter rules:\n"
+        "- Min bounty: pinned exactly\n"
+        "- Max bounty: ±10% flex if needed\n"
+        "- Start multiplier: fixed at 2.0"
     )
 
 
@@ -653,14 +679,12 @@ if "comparison_runs" not in st.session_state:
 
 # ─── Simulation runner ───
 
-def run_simulation(pool, players, min_bounty, max_bounty,
-                   mult_start, label=""):
+def run_simulation(pool, players, min_bounty, max_bounty, label=""):
     """Run BountyArchitect v18 and return results dict."""
     try:
         engine = BountyArchitect(
             pool=pool, players=players,
             min_bounty=min_bounty, max_bounty=max_bounty,
-            mult_start=mult_start,
         )
         k, ideal, final, counts, meta = engine.build()
 
@@ -694,11 +718,11 @@ def run_simulation(pool, players, min_bounty, max_bounty,
             "players": players,
             "min_bounty": min_bounty,
             "max_bounty": max_bounty,
-            "mult_start": mult_start,
+            "mult_start": BountyArchitect.MULT_START,
             "warnings": engine.warnings,
             "meta": meta,
             "params": {
-                "mult_start": mult_start,
+                "mult_start": BountyArchitect.MULT_START,
                 "actual_min": meta['actual_min'],
                 "actual_max": meta['actual_max'],
                 "alpha": meta['alpha'],
@@ -901,10 +925,6 @@ with tab_manual:
         min_bounty = st.number_input(
             "Min Bounty (USDT)",
             min_value=1.0, max_value=10000.0, value=100.0, step=10.0)
-        mult_start = st.number_input(
-            "Start Multiplier",
-            min_value=1.2, max_value=5.0, value=2.0, step=0.1,
-            help="Target tier-to-tier ratio at L1→L2. Engine may flex ±10%.")
     with mcol2:
         players = st.number_input(
             "Players",
@@ -920,7 +940,7 @@ with tab_manual:
         with st.spinner("Searching for optimal distribution..."):
             result = run_simulation(
                 pool, players, min_bounty, max_bounty,
-                mult_start, label="Manual")
+                label="Manual")
         if result:
             st.session_state["last_manual_result"] = result
             render_results(result)
@@ -1057,16 +1077,13 @@ with tab_metabase:
                     value=max(5.0, round(sim_pool * 0.10, 0))
                     if sim_pool > 0 else 100.0,
                     step=5.0)
-                mb_mult = st.number_input(
-                    "Start multiplier",
-                    min_value=1.2, max_value=5.0, value=2.0, step=0.1)
 
             if st.button("🎯 Simulate", type="primary",
                           use_container_width=True):
                 with st.spinner("Searching for optimal distribution..."):
                     result = run_simulation(
                         sim_pool, player_count, mb_min, mb_max,
-                        mb_mult, label=row['tournament_name'])
+                        label=row['tournament_name'])
                 if result:
                     st.session_state["last_metabase_result"] = result
                     render_results(result)
