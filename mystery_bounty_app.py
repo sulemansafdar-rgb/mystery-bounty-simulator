@@ -26,65 +26,51 @@ import plotly.express as px
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: ENGINE — BountyArchitect v18 (Power-Curve)
+# SECTION 1: ENGINE — BountyArchitect v19 (Ratio-Interpolation)
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # HOW IT WORKS:
-#   1. User provides 5 inputs: pool, players, min, max, start_multiplier
-#   2. Engine searches over (K, alpha, top_pattern, count_steepness, min_flex,
-#      max_flex) to find the distribution that best satisfies all conditions:
-#        C1: Hard rules — top tier = 1 player, values increasing, counts decreasing
-#        C2: Pool match — total ≈ prize pool (< 3% drift, then fine-tuned)
-#        C3: Count shape — linear at top (1,3,6 style), smooth decay to L1
-#        C4: Value ratios — monotonically increasing from ~start_mult upward
-#   3. Values use power-curve: v(t) = min × (max/min)^(t^α), α > 1 gives
-#      increasing ratios naturally.
-#   4. Counts use top-pattern + smooth exponential decay for lower tiers.
+#   1. User provides 4 inputs: pool, players, min_bounty, max_bounty
+#   2. Engine searches over (K, mult_start, mult_end, count_rate) to find the
+#      distribution that best satisfies all conditions:
+#        C1: Hard rules — top=1, values increasing, counts decreasing
+#        C2: Pool match — total ≈ prize pool (fine-tuned to < 0.1% drift)
+#        C3: Count shape — exponential decay with smooth rate
+#        C4: Top-3 cap — 2nd-last ≤ 3 players, 3rd-last ≤ 6 players
+#        C5: All ratios ≥ 1.9
+#   3. Values use ratio interpolation: ratios smoothly transition from
+#      mult_start to mult_end using t^1.5 power curve.
+#   4. Mid-tier values scaled to match pool, then fine-tuned.
+#   5. Counts use exponential weights with configurable rate.
 #
-# PARAMETER RELAXATION (built into engine, not user-facing):
+# CONSTRAINTS:
 #   - Min bounty: pinned exactly (guaranteed minimum, no flex)
-#   - Max bounty: ±10% flex only if exact value yields no solution
-#   - Start multiplier: fixed at 2.0
+#   - Max bounty: pinned exactly (±10% flex only if no solution)
+#   - DENOM: adaptive ($10 for min≥$10, $5 for smaller values)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BountyArchitect:
-    """Mystery Bounty prize distribution engine v18 — Power-Curve.
+    """Mystery Bounty prize distribution engine v19 — Ratio-Interpolation.
 
-    Generates a complete prize distribution with increasing value ratios,
-    smooth count decay, and linear top-tier counts.
+    Generates a prize distribution using smooth ratio interpolation between
+    mult_start and mult_end, with exponential player count decay and
+    mid-tier pool scaling.
 
     Parameters:
         pool (float)       : Total bounty pool in USDT
         players (int)      : Number of players receiving bounties
-        min_bounty (float) : Guaranteed smallest bounty (pinned exactly, no flex)
-        max_bounty (float) : Target largest bounty (±10% flex if no exact solution)
+        min_bounty (float) : Guaranteed smallest bounty (pinned exactly)
+        max_bounty (float) : Guaranteed largest bounty (pinned exactly)
 
-    Fixed:
-        mult_start = 2.0   : Starting multiplier (L1→L2 ratio target)
-        DENOM              : Adaptive — 10 for min≥10, smaller for small min values
+    Auto-discovered:
+        K              : Number of tiers (7–13)
+        mult_start     : Starting ratio (L1→L2), typically 2.0–2.6
+        mult_end       : Ending ratio (L(k-1)→Lk), typically 2.0–2.6
+        count_rate     : Exponential decay rate for player counts
+        DENOM          : Adaptive — $10 for min≥$10, $5 for smaller values
     """
 
-    MULT_START = 2.0  # Fixed starting multiplier
-
-    # Top-tier count patterns: CAPPED at [1, ≤3, ≤6]
-    # 2nd-last tier max 3 players, 3rd-last tier max 6 players
-    TOP_PATTERNS = [
-        [1, 2, 3], [1, 2, 4], [1, 2, 5], [1, 2, 6],
-        [1, 3, 5], [1, 3, 6],
-    ]
-
-    @staticmethod
-    def _calc_denom(min_bounty):
-        """Adaptive denomination for clean value snapping.
-
-        Uses $5 increments for small min values (produces $15, $30, $65
-        instead of $12, $28, $68). Uses $10 for min≥$10.
-        """
-        if min_bounty >= 10 and min_bounty % 10 == 0:
-            return 10
-        if min_bounty % 5 == 0:
-            return 5
-        return 5  # Default to $5 snapping for cleaner values
+    MULT_START = 2.0  # Default starting multiplier (class-level reference)
 
     def __init__(self, pool, players, min_bounty, max_bounty):
         if pool <= 0 or players <= 0:
@@ -98,414 +84,243 @@ class BountyArchitect:
         self.players = players
         self.min_val = min_bounty
         self.max_val = max_bounty
-        self.mult_start = self.MULT_START
-        self.DENOM = self._calc_denom(min_bounty)
+        # Adaptive DENOM: $10 for clean multiples, $5 for small values
+        if min_bounty >= 10 and min_bounty % 10 == 0:
+            self.DENOM = 10
+        else:
+            self.DENOM = 5
         self.warnings = []
 
-    # ── Value generation via power curve ──────────────────────────────────
-
-    def _power_curve_values(self, k, mn, mx, alpha):
-        """Generate bounty values using v(t) = mn × (mx/mn)^(t^α).
-
-        α > 1 produces increasing tier-to-tier ratios (slow start,
-        fast finish), which is the desired shape.
-
-        Returns list of k values snapped to DENOM.
-        """
+    def _round(self, x):
+        """Round to nearest DENOM."""
         d = self.DENOM
-        vals = []
-        for i in range(k):
-            t = i / (k - 1) if k > 1 else 0
-            v = mn * (mx / mn) ** (t ** alpha)
-            v = round(v / d) * d
-            vals.append(v)
-        vals[0] = mn
-        vals[-1] = mx
+        return int(round(x / d)) * d
 
-        # Fix non-strictly-increasing after rounding
-        for i in range(1, k):
-            if vals[i] <= vals[i - 1]:
-                vals[i] = vals[i - 1] + d
+    # ── Player allocation (exponential weights) ─────────────────────────
 
-        # Clamp last value back to mx without discarding candidate
-        if vals[-1] != mx:
-            if vals[-2] < mx:
-                vals[-1] = mx
-            else:
-                vals[-1] = vals[-2] + d
+    def _allocate_players(self, k, rate):
+        """Allocate players using exponential decay weights.
 
-        return vals
-
-    # ── Count generation ─────────────────────────────────────────────────
-
-    def _build_counts(self, k, top_pattern, steep):
-        """Build player counts: top tiers from pattern, rest via smooth decay.
-
-        Args:
-            k: number of tiers
-            top_pattern: e.g. [1, 3, 6] for top-3 tier counts
-            steep: multiplier for count growth going downward (1.3-2.7)
-
-        Returns list of k counts, or None if invalid.
+        rate controls how steeply counts drop from L1 down to Lk.
+        Higher rate = more players in lower tiers.
         """
-        if k <= len(top_pattern):
-            return None
-
-        counts = [0] * k
-        for j, c in enumerate(top_pattern):
-            counts[k - 1 - j] = c
-
-        # Build remaining tiers downward with smooth growth
-        for i in range(k - len(top_pattern) - 1, -1, -1):
-            above = counts[i + 1]
-            counts[i] = max(above + 1, round(above * steep))
+        weights = [rate ** (k - 1 - i) for i in range(k - 1)] + [1.0]
+        w_sum = sum(weights)
+        counts = [max(1, int(round(w / w_sum * self.players)))
+                  for w in weights]
+        counts[-1] = 1  # Top tier always 1 player
 
         # Adjust L1 to hit exact player count
         diff = self.players - sum(counts)
         counts[0] += diff
 
-        # Validate
-        if counts[0] <= 0 or counts[0] <= counts[1]:
-            return None
-        if any(counts[i] <= counts[i + 1] for i in range(k - 1)):
-            return None
-
+        # Fix any non-strictly-decreasing violations
+        for _ in range(k * 50):
+            swapped = False
+            for i in range(k - 1):
+                if counts[i] <= counts[i + 1]:
+                    counts[i] += 1
+                    counts[i + 1] -= 1
+                    swapped = True
+            if not swapped:
+                break
         return counts
 
-    # ── Scoring ──────────────────────────────────────────────────────────
+    # ── Value generation (ratio interpolation) ──────────────────────────
 
-    # Preferred top patterns — lower index = more preferred
-    # All capped at [1, ≤3, ≤6]
-    PREFERRED_TOPS = [
-        [1, 3, 6], [1, 3, 5], [1, 2, 5], [1, 2, 4], [1, 2, 3],
-        [1, 2, 6],
-    ]
+    def _generate_and_scale(self, k, ms, me, counts):
+        """Generate values via ratio interpolation + pool-aware scaling.
 
-    @staticmethod
-    def _score(vals, counts, pool, mult_start_target):
-        """Score a candidate distribution. Lower is better.
-
-        Components:
-          - Pool drift (most important)
-          - Ratio monotonicity (must be increasing)
-          - First ratio deviation from target start_mult
-          - Count cliff factor (L1/L2 vs L2/L3 ratio)
-          - Top-pattern linearity (prefer [1,3,6] style)
-        """
-        k = len(vals)
-        total = sum(v * c for v, c in zip(vals, counts))
-        drift = abs(pool - total) / pool * 100
-
-        ratios = [vals[i + 1] / vals[i] for i in range(k - 1)]
-
-        # Count ratio decreases from index 1 onward (skip first ratio
-        # which may spike due to DENOM snapping on small min values)
-        n_dec = sum(1 for i in range(1, len(ratios) - 1)
-                    if ratios[i + 1] < ratios[i] - 0.02)
-
-        # First ratio deviation from target (lenient for small values)
-        first_dev = abs(ratios[0] - mult_start_target)
-
-        # Count cliff: L1/L2 vs L2/L3
-        r12 = counts[0] / counts[1] if counts[1] > 0 else 999
-        r23 = counts[1] / counts[2] if counts[2] > 0 else 999
-        cliff = r12 / r23 if r23 > 0 else 999
-
-        # Top-pattern preference: favor small, clean top-tier counts
-        # [1,3,6]=sum 10 vs [1,4,7]=sum 12 vs [1,3,8]=sum 12
-        # Also penalize L1 absorbing too many players (>50% of total)
-        top3_sum = sum(counts[-3:])
-        l1_share = counts[0] / sum(counts) if sum(counts) > 0 else 0
-
-        score = (drift * 15
-                 + n_dec * 80
-                 + first_dev * 5
-                 + max(0, cliff - 2.5) * 30
-                 + max(0, top3_sum - 10) * 0.3
-                 + max(0, l1_share - 0.45) * 10)
-
-        return score, drift, ratios, n_dec
-
-    # ── Fine-tune pool drift ─────────────────────────────────────────────
-
-    def _fine_tune(self, vals, counts):
-        """Nudge middle-tier values by DENOM steps to reduce pool drift.
-
-        Preserves both value ordering AND ratio monotonicity.
+        Ratios smoothly transition from ms (mult_start) to me (mult_end)
+        using t^1.5 power interpolation. Mid-tier values then scaled to
+        match pool, followed by DENOM-step fine-tuning.
         """
         d = self.DENOM
-        k = len(vals)
-        final = list(vals)
-        drift = self.pool - sum(v * c for v, c in zip(final, counts))
+        n = k - 1  # number of ratios
 
-        def _ratios_ok(v, idx):
-            """Check that ratios around idx stay monotonically non-decreasing."""
-            for j in range(max(0, idx - 1), min(len(v) - 1, idx + 1)):
-                r_here = v[j + 1] / v[j]
-                if j > 0:
-                    r_prev = v[j] / v[j - 1]
-                    if r_here < r_prev - 0.005:
-                        return False
-                if j + 2 < len(v):
-                    r_next = v[j + 2] / v[j + 1]
-                    if r_next < r_here - 0.005:
-                        return False
-            return True
+        # Build ratio sequence using t^1.5 interpolation
+        ratios = []
+        for i in range(n):
+            t = i / (n - 1) if n > 1 else 0.5
+            ratios.append(ms + (me - ms) * (t ** 1.5))
 
-        for _ in range(500):
+        # Generate raw values from ratios
+        vals = [float(self.min_val)]
+        for i in range(1, k):
+            vals.append(vals[-1] * ratios[i - 1])
+
+        # Round mid-tiers, pin anchors
+        for i in range(1, k - 1):
+            vals[i] = self._round(vals[i])
+        vals[0] = self.min_val
+        vals[-1] = self.max_val
+
+        # Fix monotonicity
+        for i in range(1, k):
+            if vals[i] <= vals[i - 1]:
+                vals[i] = vals[i - 1] + d
+
+        # Scale mid-tiers (L3 through L(k-1)) to match pool
+        fixed_sum = (vals[0] * counts[0] + vals[1] * counts[1]
+                     + vals[-1] * counts[-1])
+        target_mid = self.pool - fixed_sum
+        mid_idx = list(range(2, k - 1))
+
+        if mid_idx:
+            current_mid = sum(vals[i] * counts[i] for i in mid_idx)
+            if current_mid > 0 and target_mid > 0:
+                scale = target_mid / current_mid
+                for i in mid_idx:
+                    vals[i] = self._round(vals[i] * scale)
+
+        # Fix monotonicity after scaling
+        for i in range(1, k):
+            if vals[i] <= vals[i - 1]:
+                vals[i] = vals[i - 1] + d
+        vals[-1] = self.max_val
+
+        # Fine-tune: nudge mid values by DENOM steps to reduce pool drift
+        total = sum(v * c for v, c in zip(vals, counts))
+        drift = self.pool - total
+        for _ in range(200):
             if abs(drift) < d:
                 break
             step = d if drift > 0 else -d
             moved = False
-            for i in range(1, k - 1):
+            for i in range(2, k - 1):
                 if abs(drift) < d:
                     break
-                nv = final[i] + step
-                if final[i - 1] < nv < final[i + 1]:
-                    old_val = final[i]
-                    final[i] = nv
-                    if _ratios_ok(final, i):
-                        new_drift = drift - step * counts[i]
-                        if abs(new_drift) < abs(drift):
-                            drift = new_drift
-                            moved = True
-                        else:
-                            final[i] = old_val
-                    else:
-                        final[i] = old_val
+                nv = vals[i] + step
+                if vals[i - 1] < nv < vals[i + 1]:
+                    new_drift = drift - step * counts[i]
+                    if abs(new_drift) < abs(drift):
+                        vals[i] = nv
+                        drift = new_drift
+                        moved = True
             if not moved:
                 break
 
-        return final
+        return [int(v) for v in vals]
 
     # ── Main build ───────────────────────────────────────────────────────
 
     def build(self):
-        """Search for the optimal distribution and return results.
+        """Search for the optimal (K, mult_start, mult_end, rate).
 
         Returns:
             tuple: (k, ideal_vals, final_vals, counts, meta)
-              - k (int)             : Number of tiers
-              - ideal_vals (list)   : Pre-fine-tune values
-              - final_vals (list)   : Pool-corrected values
-              - counts (list)       : Player count per tier
-              - meta (dict)         : Engine metadata (actual min/max/mult used)
         """
+        best_score = float('inf')
+        best = None
         d = self.DENOM
 
-        # Min bounty: pinned exactly (guaranteed minimum, no flex)
-        min_range = [self.min_val]
+        for K in range(7, 14):
+            for ms_x100 in range(195, 265, 5):
+                ms = ms_x100 / 100.0
+                for me_x100 in range(200, 270, 5):
+                    me = me_x100 / 100.0
+                    for rate_x100 in range(175, 215, 5):
+                        rate = rate_x100 / 100.0
 
-        # Max bounty: try exact first; ±10% flex only if no solution found
-        max_exact = round(self.max_val / d) * d
-        max_lo = round(self.max_val * 0.90 / d) * d
-        max_hi = round(self.max_val * 1.10 / d) * d
-        max_step = max(d, round((max_hi - max_lo) / 20 / d) * d) or d
-        max_range_exact = [max_exact]
-        max_range_flex = list(range(max(d, max_lo), max_hi + max_step, max_step))
-
-        # Adaptive drift tolerance: tighter pools get stricter limits
-        # avg_bounty / max_bounty ratio indicates how top-heavy the pool is
-        avg_bounty = self.pool / self.players
-        top_heaviness = self.max_val / avg_bounty
-        drift_tolerance = min(15.0, max(3.0, top_heaviness * 0.5))
-
-        best_score = float('inf')
-        best_result = None
-
-        # Two-pass: try exact max first, then ±10% flex if needed
-        for max_range in [max_range_exact, max_range_flex]:
-            if best_result is not None:
-                break  # found solution with exact max
-
-            for K in range(5, 13):
-                for top in self.TOP_PATTERNS:
-                    for steep_x10 in range(13, 28, 2):
-                        steep = steep_x10 / 10.0
-                        counts = self._build_counts(K, top, steep)
-                        if counts is None:
+                        counts = self._allocate_players(K, rate)
+                        if counts[0] <= counts[1]:
+                            continue
+                        # Top-3 cap: top=1, 2nd≤3, 3rd≤6
+                        if (counts[-1] != 1 or counts[-2] > 3
+                                or counts[-3] > 6):
                             continue
 
-                        for mn in min_range:
-                            for mx in max_range:
-                                if mx <= mn:
-                                    continue
+                        vals = self._generate_and_scale(
+                            K, ms, me, counts)
 
-                                for alpha_x10 in range(8, 35, 1):
-                                    alpha = alpha_x10 / 10.0
-                                    vals = self._power_curve_values(
-                                        K, mn, mx, alpha)
-                                    if vals is None:
-                                        continue
-
-                                    # Quick checks before full scoring
-                                    ratios = [vals[i + 1] / vals[i]
-                                              for i in range(K - 1)]
-
-                                    # First ratio: wider tolerance for small
-                                    # min values where DENOM snapping causes
-                                    # natural jumps (e.g. $6→$15 = 2.5x)
-                                    r0_lo = self.mult_start * 0.75
-                                    r0_hi = self.mult_start * 1.40
-                                    if not (r0_lo <= ratios[0] <= r0_hi):
-                                        continue
-
-                                    # Ratios should be roughly increasing
-                                    # (skip first — DENOM snapping on small
-                                    # min values causes natural spike)
-                                    n_dec = sum(
-                                        1 for i in range(1, len(ratios) - 1)
-                                        if ratios[i + 1] < ratios[i] - 0.02
-                                    )
-                                    if n_dec > 1:
-                                        continue
-
-                                    score, drift, _, _ = self._score(
-                                        vals, counts, self.pool,
-                                        self.mult_start)
-
-                                    if drift > drift_tolerance:
-                                        continue
-
-                                    if score < best_score:
-                                        best_score = score
-                                        best_result = {
-                                            'k': K,
-                                            'vals': vals[:],
-                                            'counts': counts[:],
-                                            'top': top,
-                                            'alpha': alpha,
-                                            'mn': mn,
-                                            'mx': mx,
-                                        }
-
-        if best_result is None:
-            # Fallback: use simple geometric with original params
-            self.warnings.append(
-                "Could not find optimal power-curve fit. "
-                "Using fallback geometric distribution."
-            )
-            return self._fallback_build()
-
-        k = best_result['k']
-        ideal = best_result['vals']
-        counts = best_result['counts']
-
-        # Fine-tune pool drift
-        final = self._fine_tune(ideal, counts)
-
-        meta = {
-            'actual_min': best_result['mn'],
-            'actual_max': best_result['mx'],
-            'alpha': best_result['alpha'],
-            'top_pattern': best_result['top'],
-            'score': best_score,
-        }
-
-        return k, ideal, final, counts, meta
-
-    def _fallback_build(self):
-        """Pool-aware geometric fallback if power-curve search fails.
-
-        Min bounty stays pinned. Max bounty scales down within ±10%.
-        Reports adjusted params as warnings.
-        """
-        d = self.DENOM
-        best_fb = None
-        avg = self.pool / self.players
-
-        # Min pinned exactly; only flex max bounty ±10%
-        mn = self.min_val
-        if mn >= avg:
-            mn = max(d, round(avg * 0.1 / d) * d)
-        for k in range(7, 4, -1):
-            for mx_mult in [x / 100.0 for x in range(100, 89, -2)]:
-                mx = round(self.max_val * mx_mult / d) * d
-                if mx <= mn * 3 or mx <= avg:
-                    continue
-
-                ratio = (mx / mn) ** (1.0 / (k - 1))
-                vals = [mn]
-                for i in range(1, k):
-                    vals.append(round(vals[-1] * ratio / d) * d)
-                vals[0] = mn
-                vals[-1] = mx
-                for i in range(1, k):
-                    if vals[i] <= vals[i - 1]:
-                        vals[i] = vals[i - 1] + d
-
-                for tp in self.TOP_PATTERNS[:6]:
-                    if len(tp) > k:
-                        continue
-                    for steep in [1.3, 1.5, 2.0, 2.5]:
-                        counts = self._build_counts(k, tp, steep)
-                        if counts is None:
+                        # Validate: strictly increasing, all ratios ≥ 1.9
+                        ok = True
+                        act_ratios = []
+                        for i in range(K - 1):
+                            if vals[i + 1] <= vals[i]:
+                                ok = False
+                                break
+                            act_ratios.append(vals[i + 1] / vals[i])
+                        if not ok:
+                            continue
+                        if any(r < 1.90 for r in act_ratios):
                             continue
 
                         total = sum(v * c for v, c in zip(vals, counts))
-                        drift = abs(total - self.pool) / self.pool * 100
+                        drift_pct = abs(total - self.pool) / self.pool * 100
+                        if drift_pct > 5:
+                            continue
 
-                        if best_fb is None or drift < best_fb[0]:
-                            best_fb = (drift, k, vals[:], counts[:],
-                                       mn, mx, tp)
+                        # Score: low drift + smooth ratio progression
+                        ratio_jumps = sum(
+                            abs(act_ratios[i + 1] - act_ratios[i])
+                            for i in range(len(act_ratios) - 1))
+                        # Prefer higher K (more tiers = smoother curve)
+                        k_bonus = max(0, 11 - K) * 5
+                        score = (drift_pct * 10 + ratio_jumps * 50
+                                 + k_bonus)
 
-        if best_fb and best_fb[0] < 20:
-            _, k, vals, counts, mn, mx, tp = best_fb
-            final = self._fine_tune(vals, counts)
-            if mn != self.min_val or mx != self.max_val:
-                self.warnings.append(
-                    f"Inputs adjusted for feasibility: "
-                    f"min ${self.min_val}→${mn}, "
-                    f"max ${self.max_val:,}→${mx:,}"
-                )
-            meta = {
-                'actual_min': mn,
-                'actual_max': mx,
-                'alpha': 1.0,
-                'top_pattern': tp,
-                'score': -1,
-            }
-            return k, vals, final, counts, meta
+                        if score < best_score:
+                            best_score = score
+                            best = {
+                                'k': K, 'vals': vals, 'counts': counts,
+                                'ms': ms, 'me': me, 'rate': rate,
+                                'total': total, 'drift': drift_pct,
+                                'score': score, 'ratios': act_ratios,
+                            }
 
-        # Last resort: scale everything from pool/players average
-        k = 6
-        mn = round(avg * 0.15 / d) * d or d
-        mx = round(avg * 8 / d) * d
+        if best is None:
+            self.warnings.append(
+                "Could not find valid distribution. "
+                "Try adjusting min/max bounty."
+            )
+            return self._fallback_build()
+
+        k = best['k']
+        vals = best['vals']
+        counts = best['counts']
+        meta = {
+            'actual_min': vals[0],
+            'actual_max': vals[-1],
+            'alpha': best['ms'],  # mult_start (displayed as alpha)
+            'top_pattern': [counts[-1], counts[-2], counts[-3]],
+            'score': best['score'],
+            'mult_start': best['ms'],
+            'mult_end': best['me'],
+            'count_rate': best['rate'],
+        }
+
+        return k, vals, vals, counts, meta
+
+    def _fallback_build(self):
+        """Simple geometric fallback when main search fails."""
+        d = self.DENOM
+        avg = self.pool / self.players
+        k = 8
+        mn = self.min_val
+        mx = self.max_val
+
         ratio = (mx / mn) ** (1.0 / (k - 1))
         vals = [mn]
         for i in range(1, k):
-            vals.append(round(vals[-1] * ratio / d) * d)
+            vals.append(self._round(vals[-1] * ratio))
         vals[0] = mn
         vals[-1] = mx
         for i in range(1, k):
             if vals[i] <= vals[i - 1]:
                 vals[i] = vals[i - 1] + d
 
-        counts = [0] * k
-        counts[-1] = 1
-        counts[-2] = 2
-        counts[-3] = max(3, min(5, self.players // 20))
-        for i in range(k - 4, -1, -1):
-            counts[i] = max(counts[i + 1] + 1,
-                            round(counts[i + 1] * 1.5))
-        diff = self.players - sum(counts)
-        counts[0] += diff
-        if counts[0] <= counts[1]:
-            counts[0] = counts[1] + 1
+        rate = 1.85
+        counts = self._allocate_players(k, rate)
 
-        self.warnings.append(
-            f"Original min/max infeasible for this pool. "
-            f"Auto-adjusted to min=${mn}, max=${mx:,}"
-        )
-        final = self._fine_tune(vals, counts)
         meta = {
-            'actual_min': mn,
-            'actual_max': mx,
-            'alpha': 1.0,
-            'top_pattern': [1, 2, counts[-3]],
-            'score': -1,
+            'actual_min': mn, 'actual_max': mx,
+            'alpha': ratio, 'top_pattern': [1, 2, 3],
+            'score': -1, 'mult_start': ratio,
+            'mult_end': ratio, 'count_rate': rate,
         }
-        return k, vals, final, counts, meta
+
+        return k, vals, vals, counts, meta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
